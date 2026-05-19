@@ -74,7 +74,7 @@ type AuthStep = "signin" | "signup" | "pick-username" | "verify-email" | "forgot
 type CallLogEntry = { id: string; peer: string; peerName: string; direction: "incoming" | "outgoing"; media: "audio" | "video"; status: "completed" | "missed" | "rejected"; timestamp: string; duration: number };
 type WsStatus = "connected" | "disconnected" | "reconnecting";
 type ProfileTab = "info" | "media" | "calls" | "members";
-type StoredCallOffer = { sdp: RTCSessionDescriptionInit; peer: string; peerName: string; isVideo: boolean; ts: number; };
+type StoredCallOffer = { sdp: RTCSessionDescriptionInit; peer: string; peerName: string; isVideo: boolean; ts: number; group_id?: string | number; };
 
 // ─── AUTH REDUCER ─────────────────────────────────────────────────────────────
 type AuthState = { step: AuthStep; email: string; pass: string; pass2: string; user: string; loading: boolean; error: string };
@@ -1651,7 +1651,11 @@ export default function FluxChat() {
         return false;
       }
       if (callStateRef.current !== "idle") return false; // already in a call
-      pendingRemoteDescriptionRef.current = parsed.sdp;
+      const sdpObj = (parsed.sdp && typeof parsed.sdp === "object") ? parsed.sdp as any : {};
+      const offerGroupId = parsed.group_id || sdpObj.group_id;
+      if (offerGroupId) callGroupIdRef.current = offerGroupId;
+      const realSdp = sdpObj.sdp ? { type: sdpObj.type, sdp: sdpObj.sdp } : parsed.sdp;
+      pendingRemoteDescriptionRef.current = realSdp;
       setCallPeer(parsed.peer);
       setCallPeerName(parsed.peerName);
       setIsVideoCall(parsed.isVideo);
@@ -1858,14 +1862,19 @@ export default function FluxChat() {
       case "call_offer": {
         const callerEmail = String(data.user || "");
         const vid = Boolean(data.isVideo);
+        const sdpObj = (data.sdp && typeof data.sdp === "object") ? data.sdp as any : {};
+        const isMesh = Boolean(data.is_mesh || sdpObj.is_mesh);
+        const offerGroupId = data.group_id || sdpObj.group_id;
+        const offerSenderName = data.sender_name || sdpObj.sender_name;
+        const realSdp = sdpObj.sdp ? { type: sdpObj.type, sdp: sdpObj.sdp } : data.sdp;
 
         // ── MESH OFFER: auto-accept silently if already in this call ──────────
-        if (data.is_mesh) {
+        if (isMesh) {
           if (callStateRef.current === "connected") {
             if (!pcMapRef.current.has(callerEmail)) {
               try {
                 const meshPc = await setupWebRTC(callerEmail);
-                await meshPc.setRemoteDescription(new RTCSessionDescription(data.sdp as RTCSessionDescriptionInit));
+                await meshPc.setRemoteDescription(new RTCSessionDescription(realSdp as RTCSessionDescriptionInit));
                 const queue = iceQueuesRef.current.get(callerEmail) || [];
                 while (queue.length > 0) { const c = queue.shift(); if (c) await meshPc.addIceCandidate(new RTCIceCandidate(c)).catch(console.error); }
                 iceQueuesRef.current.set(callerEmail, queue);
@@ -1874,31 +1883,35 @@ export default function FluxChat() {
                 wsSend(JSON.stringify({ type: "call_answer", target_user: callerEmail, sdp: meshAnswer }));
               } catch (e) { console.error("[Mesh] auto-accept failed", e); }
             }
-          } else if (callStateRef.current === "incoming") {
-            pendingMeshOffersRef.current.set(callerEmail, data.sdp as RTCSessionDescriptionInit);
+          } else {
+            // Store for any non-connected state: "incoming" OR "idle" (race with main offer)
+            pendingMeshOffersRef.current.set(callerEmail, realSdp as RTCSessionDescriptionInit);
           }
           break;
         }
 
         iceCandidateQueueRef.current = [];
         iceQueuesRef.current.clear();
-        pendingMeshOffersRef.current.clear();
-        if (data.group_id) callGroupIdRef.current = data.group_id as string | number;
+        if (callStateRef.current === "idle") {
+          pendingMeshOffersRef.current.clear();
+        }
+        if (offerGroupId) callGroupIdRef.current = offerGroupId as string | number;
 
         // 1. Resolve display name from existing contacts first (sync, no await)
         const existingContact = contactsRef.current.find(c => c.email === callerEmail);
-        const callerDisplayName = (String(data.sender_name || "").trim())
+        const callerDisplayName = (String(offerSenderName || "").trim())
           || (existingContact ? contactLabelFn(existingContact) : "")
           || callerEmail.split("@")[0]
           || "Incoming Call";
 
         // 2. Persist to sessionStorage IMMEDIATELY so native foreground restore works
         const offerPayload: StoredCallOffer = {
-          sdp: data.sdp as RTCSessionDescriptionInit,
+          sdp: realSdp as RTCSessionDescriptionInit,
           peer: callerEmail,
           peerName: callerDisplayName,
           isVideo: vid,
           ts: Date.now(),
+          group_id: offerGroupId as string | number,
         };
         try { sessionStorage.setItem("_Flux_call_offer", JSON.stringify(offerPayload)); } catch { }
 
@@ -1909,7 +1922,7 @@ export default function FluxChat() {
         isVideoCallRef.current = vid;
         updateCallState("incoming");
         callDirectionRef.current = "incoming";
-        pendingRemoteDescriptionRef.current = data.sdp as RTCSessionDescriptionInit;
+        pendingRemoteDescriptionRef.current = realSdp as RTCSessionDescriptionInit;
 
         // 4. Start ringtone + notification IMMEDIATELY (before any async work)
         startRingtone();
@@ -2231,37 +2244,42 @@ export default function FluxChat() {
     pc.ontrack = event => {
       // Android WebView sometimes delivers tracks without a stream bundled.
       // Build the stream from the track if needed.
-      let stream: MediaStream;
-      if (event.streams && event.streams.length > 0) {
-        stream = event.streams[0];
-      } else {
-        stream = remoteStreamRef.current ?? new MediaStream();
-        if (!stream.getTracks().find(t => t.id === event.track.id)) {
-          stream.addTrack(event.track);
+      setRemoteStreams(prev => {
+        let stream: MediaStream;
+        if (event.streams && event.streams.length > 0) {
+          stream = event.streams[0];
+        } else {
+          stream = prev[targetEmail] || new MediaStream();
+          if (!stream.getTracks().find(t => t.id === event.track.id)) {
+            stream.addTrack(event.track);
+          }
         }
-      }
 
-      remoteStreamRef.current = stream;
-      setRemoteStreams(prev => ({ ...prev, [targetEmail]: stream }));
+        if (targetEmail === callPeerRef.current) {
+          remoteStreamRef.current = stream;
 
-      // ── Always attach to the in-DOM <video> element ──────────────────
-      // A detached `new Audio()` is unreliable on Android WebView.
-      // The <video> element (even hidden for voice calls) plays both
-      // audio and video tracks reliably.
-      const videoEl = remoteVideoRef.current;
-      if (videoEl && videoEl.srcObject !== stream) {
-        videoEl.srcObject = stream;
-        videoEl.volume = 1.0;
-        videoEl.play().catch(() => { });
-      }
+          // ── Always attach to the in-DOM <video> element ──────────────────
+          // A detached `new Audio()` is unreliable on Android WebView.
+          // The <video> element (even hidden for voice calls) plays both
+          // audio and video tracks reliably.
+          const videoEl = remoteVideoRef.current;
+          if (videoEl && videoEl.srcObject !== stream) {
+            videoEl.srcObject = stream;
+            videoEl.volume = 1.0;
+            videoEl.play().catch(() => { });
+          }
 
-      // Also attach to the dedicated audio element as a backup path
-      const audioEl = remoteAudioRef.current;
-      if (audioEl && audioEl.srcObject !== stream) {
-        audioEl.srcObject = stream;
-        audioEl.volume = 1.0;
-        audioEl.play().catch(() => { });
-      }
+          // Also attach to the dedicated audio element as a backup path
+          const audioEl = remoteAudioRef.current;
+          if (audioEl && audioEl.srcObject !== stream) {
+            audioEl.srcObject = stream;
+            audioEl.volume = 1.0;
+            audioEl.play().catch(() => { });
+          }
+        }
+
+        return { ...prev, [targetEmail]: stream };
+      });
 
       // Set AudioManager to IN_COMMUNICATION so Android routes audio
       // through the voice pipeline (echo cancellation, correct device routing)
@@ -2318,7 +2336,20 @@ export default function FluxChat() {
       if (localVideoRef.current) { localVideoRef.current.srcObject = localStreamRef.current; localVideoRef.current.play().catch(() => { }); }
       for (const target of targetIds) {
         const pc = await setupWebRTC(target); const offer = await pc.createOffer(); await pc.setLocalDescription(offer);
-        wsSend(JSON.stringify({ type: "call_offer", target_user: target, sdp: offer, isVideo: video, sender_name: profile.displayName || profile.username || currentUser, ...(groupId ? { group_id: groupId } : {}) }));
+        const wrappedSdp = {
+          type: offer.type,
+          sdp: offer.sdp,
+          ...(groupId ? { group_id: groupId } : {}),
+          sender_name: profile.displayName || profile.username || currentUser
+        };
+        wsSend(JSON.stringify({
+          type: "call_offer",
+          target_user: target,
+          sdp: wrappedSdp,
+          isVideo: video,
+          sender_name: profile.displayName || profile.username || currentUser,
+          ...(groupId ? { group_id: groupId } : {})
+        }));
       }
     } catch (err: any) { alert(`Could not start call: ${err.message || err}`); endCall(false); }
   };
@@ -2346,7 +2377,13 @@ export default function FluxChat() {
           const stored = sessionStorage.getItem("_Flux_call_offer");
           if (stored) {
             const parsed: StoredCallOffer = JSON.parse(stored);
-            pendingRemoteDescriptionRef.current = parsed.sdp;
+            const sdpObj = (parsed.sdp && typeof parsed.sdp === "object") ? parsed.sdp as any : {};
+            const offerGroupId = parsed.group_id || sdpObj.group_id;
+            if (offerGroupId) {
+              callGroupIdRef.current = offerGroupId;
+            }
+            const realSdp = sdpObj.sdp ? { type: sdpObj.type, sdp: sdpObj.sdp } : parsed.sdp;
+            pendingRemoteDescriptionRef.current = realSdp;
             if (!callPeerRef.current && parsed.peer) {
               callPeerRef.current = parsed.peer;
               callPeerNameRef.current = parsed.peerName;
@@ -2422,20 +2459,41 @@ export default function FluxChat() {
       updateCallState("connected");
       callStartTimeRef.current = Date.now();
 
-      // 7b. MESH: If this is a group call, send offers to all OTHER members
-      //     (the ones who didn't send the original offer to us)
+      // 7b. MESH: If this is a group call, send offers to members we DON'T already have a pending offer from
       const meshGroupId = callGroupIdRef.current;
       if (meshGroupId) {
         const group = groupsRef.current.find(g => String(g.id) === String(meshGroupId));
         if (group) {
-          const otherMembers = group.members.map(getEmail).filter(m => m !== currentUser && m !== targetPeer);
+          const otherMembers = group.members
+            .map(getEmail)
+            .filter(m =>
+              m !== currentUser &&
+              m !== targetPeer &&
+              !pendingMeshOffersRef.current.has(m) && // Skip — they offered us, we'll answer in 7c
+              m > currentUser                         // Glare-free tie breaker: only smaller email initiates mesh offer
+            );
           for (const meshPeer of otherMembers) {
             if (!pcMapRef.current.has(meshPeer)) {
               try {
                 const meshPc = await setupWebRTC(meshPeer);
                 const meshOffer = await meshPc.createOffer();
                 await meshPc.setLocalDescription(meshOffer);
-                wsSend(JSON.stringify({ type: "call_offer", target_user: meshPeer, sdp: meshOffer, isVideo: needVideo, is_mesh: true, sender_name: profile.displayName || profile.username || currentUser }));
+                const wrappedMeshOffer = {
+                  type: meshOffer.type,
+                  sdp: meshOffer.sdp,
+                  is_mesh: true,
+                  group_id: meshGroupId,
+                  sender_name: profile.displayName || profile.username || currentUser
+                };
+                wsSend(JSON.stringify({
+                  type: "call_offer",
+                  target_user: meshPeer,
+                  sdp: wrappedMeshOffer,
+                  isVideo: needVideo,
+                  is_mesh: true,
+                  group_id: meshGroupId,
+                  sender_name: profile.displayName || profile.username || currentUser
+                }));
               } catch (e) { console.error("[Mesh] offer failed for", meshPeer, e); }
             }
           }
@@ -2472,6 +2530,60 @@ export default function FluxChat() {
           applyAudioOutput(isSpeaker);
         }
       }, 300);
+
+      // ── MESH RETRY: after 4 s check for any group members we failed to connect ──
+      const retryGroupId = callGroupIdRef.current;
+      if (retryGroupId) {
+        setTimeout(async () => {
+          if (callStateRef.current !== "connected") return;
+          const retryGroup = groupsRef.current.find(g => String(g.id) === String(retryGroupId));
+          if (!retryGroup) return;
+          const me = currentUserRef.current;
+          const resolvedTarget = callPeerRef.current;
+          const missingPeers = retryGroup.members
+            .map(getEmail)
+            .filter(m =>
+              m !== me &&
+              m !== resolvedTarget &&
+              // Not connected or connection failed
+              (!pcMapRef.current.has(m) ||
+               pcMapRef.current.get(m)?.iceConnectionState === "failed" ||
+               pcMapRef.current.get(m)?.iceConnectionState === "disconnected") &&
+              // Tie-breaker: smaller email initiates
+              m > me
+            );
+          for (const meshPeer of missingPeers) {
+            if (!localStreamRef.current) break;
+            console.log(`[Mesh Retry] Sending offer to ${meshPeer}`);
+            try {
+              // Close stale PC if any
+              const old = pcMapRef.current.get(meshPeer);
+              if (old) { old.close(); pcMapRef.current.delete(meshPeer); }
+              const retryPc = await setupWebRTC(meshPeer);
+              const retryOffer = await retryPc.createOffer();
+              await retryPc.setLocalDescription(retryOffer);
+              const wrappedRetry = {
+                type: retryOffer.type,
+                sdp: retryOffer.sdp,
+                is_mesh: true,
+                group_id: retryGroupId,
+                sender_name: profile.displayName || profile.username || me,
+              };
+              wsSend(JSON.stringify({
+                type: "call_offer",
+                target_user: meshPeer,
+                sdp: wrappedRetry,
+                isVideo: isVideoCallRef.current,
+                is_mesh: true,
+                group_id: retryGroupId,
+                sender_name: profile.displayName || profile.username || me,
+              }));
+            } catch (e) {
+              console.error(`[Mesh Retry] Failed for ${meshPeer}:`, e);
+            }
+          }
+        }, 4000);
+      }
 
     } catch (err: any) {
       console.error("[Call] acceptCall failed:", err);
@@ -3209,12 +3321,12 @@ export default function FluxChat() {
               ) : (
                 Object.keys(remoteStreams).length > 0
                   ? (
-                    <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "row", zIndex: 1 }}>
+                    <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", zIndex: 1 }}>
                       {Object.entries(remoteStreams).map(([peerId, stream], _idx, arr) => {
                         const n = arr.length;
-                        const width = n <= 3 ? `${Math.floor(100 / n)}%` : "25%";
+                        const height = `${Math.floor(100 / n)}%`;
                         return (
-                          <video key={peerId} autoPlay playsInline ref={node => { if (node && node.srcObject !== stream) { node.srcObject = stream; node.play().catch(() => { }); } }} style={{ width, height: "100%", objectFit: "cover", background: "#000", flexShrink: 0, borderRight: n > 1 ? "1px solid #222" : "none" }} />
+                          <video key={peerId} autoPlay playsInline ref={node => { if (node && node.srcObject !== stream) { node.srcObject = stream; node.play().catch(() => { }); } }} style={{ width: "100%", height, objectFit: "cover", background: "#000", flexShrink: 0, borderBottom: n > 1 ? "1px solid #222" : "none" }} />
                         );
                       })}
                     </div>
@@ -3226,12 +3338,12 @@ export default function FluxChat() {
                 {isVideoSwapped ? (
                   Object.keys(remoteStreams).length > 0
                     ? (
-                      <div style={{ width: "100%", height: "100%", display: "flex", flexDirection: "row", overflow: "hidden", borderRadius: "inherit" }}>
+                      <div style={{ width: "100%", height: "100%", display: "flex", flexDirection: "column", overflow: "hidden", borderRadius: "inherit" }}>
                         {Object.entries(remoteStreams).map(([peerId, stream], _idx, arr) => {
                           const n = arr.length;
-                          const width = n <= 3 ? `${Math.floor(100 / n)}%` : "25%";
+                          const height = `${Math.floor(100 / n)}%`;
                           return (
-                            <video key={peerId} autoPlay playsInline ref={node => { if (node && node.srcObject !== stream) { node.srcObject = stream; node.play().catch(() => { }); } }} style={{ width, height: "100%", objectFit: "cover", background: "#000", flexShrink: 0 }} />
+                            <video key={peerId} autoPlay playsInline ref={node => { if (node && node.srcObject !== stream) { node.srcObject = stream; node.play().catch(() => { }); } }} style={{ width: "100%", height, objectFit: "cover", background: "#000", flexShrink: 0 }} />
                           );
                         })}
                       </div>
