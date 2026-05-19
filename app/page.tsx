@@ -1591,6 +1591,39 @@ export default function FluxChat() {
   }, []);
   const initWSRef = useRef<(() => void) | null>(null);
 
+  // ── REMOVE A SINGLE PEER FROM AN ONGOING GROUP CALL ─────────────────────────
+  const removePeerFromCall = useCallback((peerEmail: string) => {
+    // 1. Close and discard that peer's RTCPeerConnection
+    const pc = pcMapRef.current.get(peerEmail);
+    if (pc) {
+      try { pc.close(); } catch { }
+      pcMapRef.current.delete(peerEmail);
+    }
+
+    // 2. Remove their video stream from the render map
+    setRemoteStreams(prev => {
+      const next = { ...prev };
+      delete next[peerEmail];
+      return next;
+    });
+
+    // 3. If this was the primary 1-on-1 peer, clear the fallback ref too
+    if (remoteStreamRef.current) {
+      // We can't reliably tell which stream belonged to them, so don't clear the ref;
+      // the video element ref-callback comparison handles stale srcObject.
+    }
+
+    // 4. After removing, decide whether the call should continue
+    const remaining = pcMapRef.current.size;
+    const isGroupCall = !!callGroupIdRef.current;
+
+    if (!isGroupCall || remaining === 0) {
+      // 1-on-1 call, or every participant has left → full teardown
+      endCallRef.current(false, callStateRef.current === "connected" ? "completed" : "missed");
+    }
+    // else: still connected to other group members — keep the call alive
+  }, []); // eslint-disable-line
+
   const endCall = useCallback((sendSignal = true, explicitStatus?: "completed" | "missed" | "rejected") => {
     stopRingtone();
     cancelCallNotification();
@@ -1950,10 +1983,42 @@ export default function FluxChat() {
       case "call_answer": { const peer = String(data.user); const pc = pcMapRef.current.get(peer) || peerConnectionRef.current; if (pc) { await pc.setRemoteDescription(new RTCSessionDescription(data.sdp as RTCSessionDescriptionInit)); updateCallState("connected"); callStartTimeRef.current = Date.now(); const queue = iceQueuesRef.current.get(peer) || []; while (queue.length > 0) { const c = queue.shift(); if (c) await pc.addIceCandidate(new RTCIceCandidate(c)).catch(console.error); } iceQueuesRef.current.set(peer, queue); } break; }
       case "ice_candidate": { const peer = String(data.user); const pc = pcMapRef.current.get(peer) || peerConnectionRef.current; if (pc && pc.remoteDescription) { await pc.addIceCandidate(new RTCIceCandidate(data.candidate as RTCIceCandidateInit)).catch(console.error); } else { const queue = iceQueuesRef.current.get(peer) || []; queue.push(data.candidate as RTCIceCandidateInit); iceQueuesRef.current.set(peer, queue); } break; }
       case "camera_state": { setRemoteVideoMuted(data.videoMuted === true); break; }
-      case "call_end": endCallRef.current(false); break;
-      case "call_reject": endCallRef.current(false, "rejected"); break;
+      case "call_end": {
+        const leavingPeer = String(data.user || "");
+        const inGroupCall = !!callGroupIdRef.current;
+
+        if (inGroupCall && pcMapRef.current.has(leavingPeer)) {
+          // Group call: only remove that one peer
+          removePeerFromCall(leavingPeer);
+        } else if (inGroupCall && pcMapRef.current.size > 0) {
+          // Their PC isn't in our map (e.g. mesh peer we never connected to) —
+          // clean up stream entry if present and carry on
+          setRemoteStreams(prev => {
+            const next = { ...prev };
+            delete next[leavingPeer];
+            return next;
+          });
+        } else {
+          // 1-on-1, or we don't know about this peer → end call
+          endCallRef.current(false);
+        }
+        break;
+      }
+      case "call_reject": {
+        const rejectingPeer = String(data.user || "");
+        const inGroupCall = !!callGroupIdRef.current;
+
+        if (inGroupCall && pcMapRef.current.size > 1) {
+          // Group call still has other participants — just remove the rejecting peer
+          removePeerFromCall(rejectingPeer);
+        } else {
+          // 1-on-1 rejection, or last/only participant rejected
+          endCallRef.current(false, "rejected");
+        }
+        break;
+      }
     }
-  }, [updateCallState, scrollBottom, updateActivity, notify, notifyCall, startRingtone, apiFetch, contactLabelFn, persistSeenIds, loadContacts, sendReadReceipt]); // eslint-disable-line
+  }, [updateCallState, scrollBottom, updateActivity, notify, notifyCall, startRingtone, apiFetch, contactLabelFn, persistSeenIds, loadContacts, sendReadReceipt, removePeerFromCall]); // eslint-disable-line
 
   const wsHandlerRef = useRef(wsHandler);
   useEffect(() => { wsHandlerRef.current = wsHandler; }, [wsHandler]);
@@ -2597,7 +2662,18 @@ export default function FluxChat() {
     stopRingtone();
     cancelCallNotification();
     try { sessionStorage.removeItem("_Flux_call_offer"); } catch { }
-    if (wsRef.current?.readyState === WebSocket.OPEN) wsRef.current.send(JSON.stringify({ type: "call_reject", target_user: callPeer }));
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      // Notify the original caller
+      if (callPeer) {
+        wsRef.current.send(JSON.stringify({ type: "call_reject", target_user: callPeer }));
+      }
+      // Also notify any mesh peers that had already connected to us
+      pcMapRef.current.forEach((_, peerEmail) => {
+        if (peerEmail !== callPeer) {
+          wsRef.current!.send(JSON.stringify({ type: "call_end", target_user: peerEmail }));
+        }
+      });
+    }
     endCall(false, "rejected");
   };
 
