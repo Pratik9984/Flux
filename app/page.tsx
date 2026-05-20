@@ -22,8 +22,6 @@ import {
   isGroupEncrypted,
   groupKeyCache
 } from "@/lib/crypto";
-import { initOTAUpdater } from "@/lib/updater";
-
 import { createClient } from "@supabase/supabase-js";
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL || "",
