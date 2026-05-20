@@ -3888,7 +3888,7 @@ export default function FluxChat() {
                   ) : (
                     <div
                       style={{
-                        height: `${rowVirtualizer.getTotalSize()}px`,
+                        height: "100%",
                         width: "100%",
                         position: "relative",
                       }}
