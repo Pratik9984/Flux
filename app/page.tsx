@@ -7,7 +7,7 @@ import React, {
 } from "react";
 import { createPortal } from "react-dom";
 import "./globals.css";
-import { useVirtualizer } from "@tanstack/react-virtual";
+
 import { requestNotificationPermission as requestFCMPermission } from "@/lib/firebase";
 import {
   getOrCreateIdentityKeyPair,
