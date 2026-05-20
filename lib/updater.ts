@@ -1,4 +1,4 @@
-import { CapacitorUpdater } from "@capgo/capacitor-updater";
+
 import { App } from "@capacitor/app";
 import { Capacitor } from "@capacitor/core";
 
