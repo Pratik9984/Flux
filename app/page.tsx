@@ -1,15 +1,5 @@
 "use client";
 
-// ─── Flux v5.7 — Call notification & ringtone reliability fixes ──────────────
-//  Fixed: FCM/WS call_offer now triggers ringtone IMMEDIATELY before any await
-//  Fixed: startRingtone retries up to 3× on failure (native + web)
-//  Fixed: notifyCall fires synchronously at the top of call_offer handler
-//  Fixed: sessionStorage call offer checked every 5 s on native (not just on focus)
-//  Fixed: Audio pre-warm happens at app mount AND on WS connect, not just on touch
-//  Fixed: pendingRemoteDescriptionRef persisted to sessionStorage before async ops
-//  Fixed: rejectCall / endCall cancel Capacitor notification reliably
-//  Fixed: call_offer handler fully synchronous UI path; DB work moved to background
-// ──────────────────────────────────────────────────────────────────────────────
 
 import React, {
   useState, useEffect, useRef, useMemo, useCallback,
@@ -17,7 +7,22 @@ import React, {
 } from "react";
 import { createPortal } from "react-dom";
 import "./globals.css";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { requestNotificationPermission as requestFCMPermission } from "@/lib/firebase";
+import {
+  getOrCreateIdentityKeyPair,
+  encryptDM,
+  decryptDM,
+  generateGroupKey,
+  wrapGroupKeyForMember,
+  unwrapGroupKey,
+  encryptGroupMsg,
+  decryptGroupMsg,
+  isDMEncrypted,
+  isGroupEncrypted,
+  groupKeyCache
+} from "@/lib/crypto";
+import { initOTAUpdater } from "@/lib/updater";
 
 import { createClient } from "@supabase/supabase-js";
 const supabase = createClient(
@@ -72,7 +77,7 @@ type CallState = "idle" | "incoming" | "calling" | "connected";
 type ApiOptions = RequestInit & { headers?: HeadersInit; signal?: AbortSignal };
 type AuthStep = "signin" | "signup" | "pick-username" | "verify-email" | "forgot-password" | "reset-password";
 type CallLogEntry = { id: string; peer: string; peerName: string; direction: "incoming" | "outgoing"; media: "audio" | "video"; status: "completed" | "missed" | "rejected"; timestamp: string; duration: number };
-type WsStatus = "connected" | "disconnected" | "reconnecting";
+type WsStatus = "connected" | "disconnected" | "reconnecting" | "offline";
 type ProfileTab = "info" | "media" | "calls" | "members";
 type StoredCallOffer = { sdp: RTCSessionDescriptionInit; peer: string; peerName: string; isVideo: boolean; ts: number; group_id?: string | number; };
 
@@ -190,6 +195,7 @@ function ReactionPickerPortal({ anchorRef, isMine, emojis, onReact, onClose }: R
             className="reaction-btn"
             onMouseDown={ev => { ev.stopPropagation(); onReact(e); }}
             onTouchEnd={ev => { ev.stopPropagation(); onReact(e); }}
+            aria-label={`React with ${e}`}
           >
             {e}
           </button>
@@ -423,8 +429,8 @@ const MessageBubble = memo(function MessageBubble({
       <div className={`msg-row ${isMine ? "msg-mine" : "msg-theirs"}`}>
         <div className="edit-row">
           <input value={editingText} onChange={e => onEditChange(e.target.value)} onKeyDown={e => { if (e.key === "Enter") onEditSave(); if (e.key === "Escape") onEditCancel(); }} className="edit-field" autoFocus />
-          <button onClick={onEditSave} className="edit-save">✓</button>
-          <button onClick={onEditCancel} className="edit-discard">✕</button>
+          <button onClick={onEditSave} className="edit-save" aria-label="Save edit">✓</button>
+          <button onClick={onEditCancel} className="edit-discard" aria-label="Cancel edit">✕</button>
         </div>
       </div>
     );
@@ -506,6 +512,7 @@ const MessageBubble = memo(function MessageBubble({
                       onMouseDown={e => { e.stopPropagation(); onRetry(item); }}
                       onTouchEnd={e => { e.stopPropagation(); onRetry(item); }}
                       title="Tap to retry"
+                      aria-label="Retry sending message"
                     >⚠️</button>
                   ) : isPending ? (
                     <span style={{ opacity: 0.5, fontSize: 9 }}>○</span>
@@ -544,24 +551,24 @@ const MessageBubble = memo(function MessageBubble({
                 <button
                   onMouseDown={e => { e.stopPropagation(); onSetReactionPicker(isPickerOpen ? null : item.id); }}
                   onTouchEnd={e => { e.stopPropagation(); touchHandledClick.current = true; onSetReactionPicker(isPickerOpen ? null : item.id); }}
-                  className="bubble-action-btn" title="React"
+                  className="bubble-action-btn" title="React" aria-label="Add reaction"
                 >😀</button>
                 <button
                   onMouseDown={e => { e.stopPropagation(); onReply(item); }}
                   onTouchEnd={e => { e.stopPropagation(); touchHandledClick.current = true; onReply(item); }}
-                  className="bubble-action-btn" title="Reply"
+                  className="bubble-action-btn" title="Reply" aria-label="Reply to message"
                 >↩</button>
                 {isMine && (
                   <>
                     <button
                       onMouseDown={e => { e.stopPropagation(); onEditStart(item.id, item.content); }}
                       onTouchEnd={e => { e.stopPropagation(); touchHandledClick.current = true; onEditStart(item.id, item.content); }}
-                      className="bubble-action-btn" title="Edit"
+                      className="bubble-action-btn" title="Edit" aria-label="Edit message"
                     >✎</button>
                     <button
                       onMouseDown={e => { e.stopPropagation(); onDelete(item.id); }}
                       onTouchEnd={e => { e.stopPropagation(); touchHandledClick.current = true; onDelete(item.id); }}
-                      className="bubble-action-btn del-action" title="Delete"
+                      className="bubble-action-btn del-action" title="Delete" aria-label="Delete message"
                     >🗑</button>
                   </>
                 )}
@@ -599,8 +606,9 @@ interface ContactProfileProps {
   onClose: () => void; onCall: (video: boolean) => void;
   onNicknameEdit: () => void; getPeerName: (email: string) => string;
   onViewFile: (url: string, type: string) => void;
+  isBlocked: boolean; onBlock: () => void; onUnblock: () => void;
 }
-function ContactProfile({ contact: c, activeChat, currentUser, nicknames, contactLabel, callLogs, messagesCache, onClose, onCall, onNicknameEdit, getPeerName, onViewFile }: ContactProfileProps) {
+function ContactProfile({ contact: c, activeChat, currentUser, nicknames, contactLabel, callLogs, messagesCache, onClose, onCall, onNicknameEdit, getPeerName, onViewFile, isBlocked, onBlock, onUnblock }: ContactProfileProps) {
   const [tab, setTab] = useState<ProfileTab>("info");
   const label = c ? contactLabel(c) : activeChat.name;
   const avatarUrl = c?.avatar_url;
@@ -618,7 +626,7 @@ function ContactProfile({ contact: c, activeChat, currentUser, nicknames, contac
 
   return (
     <div className="profile-fs-overlay" onClick={e => e.stopPropagation()}>
-      <button className="pfs-back" onClick={onClose}>
+      <button className="pfs-back" onClick={onClose} aria-label="Back to chat">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M19 12H5M12 5l-7 7 7 7" /></svg>
       </button>
 
@@ -676,6 +684,17 @@ function ContactProfile({ contact: c, activeChat, currentUser, nicknames, contac
               <div className="pfs-info-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2" /><circle cx="12" cy="7" r="4" /></svg></div>
               <div style={{ flex: 1 }}><div className="pfs-info-label">Nickname</div><div className="pfs-info-val" style={{ color: nicknames[String(activeChat.id)] ? "#fff" : "rgba(255,255,255,0.35)" }}>{nicknames[String(activeChat.id)] || "Not set"}</div></div>
               <button className="cp-edit-btn pfs-info-edit" onClick={() => { onClose(); onNicknameEdit(); }}>{nicknames[String(activeChat.id)] ? "Edit" : "Add"}</button>
+            </div>
+            <div className="pfs-info-row" style={{ marginTop: "1.5rem", borderTop: "1px solid rgba(255,255,255,0.08)", paddingTop: "1.5rem" }}>
+              {isBlocked ? (
+                <button className="cp-block-btn unblock-btn" onClick={onUnblock} style={{ background: "rgba(76, 175, 80, 0.1)", color: "#4caf50", border: "1px solid rgba(76, 175, 80, 0.2)", padding: "10px 16px", borderRadius: "12px", width: "100%", cursor: "pointer", fontWeight: "bold", transition: "all 0.2s" }}>
+                  Unblock User
+                </button>
+              ) : (
+                <button className="cp-block-btn block-btn" onClick={onBlock} style={{ background: "rgba(244, 67, 54, 0.1)", color: "#f44336", border: "1px solid rgba(244, 67, 54, 0.2)", padding: "10px 16px", borderRadius: "12px", width: "100%", cursor: "pointer", fontWeight: "bold", transition: "all 0.2s" }}>
+                  Block User
+                </button>
+              )}
             </div>
           </div>
         )}
@@ -754,7 +773,7 @@ function GroupProfile({ group: g, activeChat, currentUser, contacts, contactLabe
 
   return (
     <div className="profile-fs-overlay" onClick={e => e.stopPropagation()}>
-      <button className="pfs-back" onClick={onClose}>
+      <button className="pfs-back" onClick={onClose} aria-label="Back to chat">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M19 12H5M12 5l-7 7 7 7" /></svg>
       </button>
 
@@ -871,11 +890,6 @@ function GroupProfile({ group: g, activeChat, currentUser, contacts, contactLabe
 // ─── MAIN COMPONENT ───────────────────────────────────────────────────────────
 export default function FluxChat() {
   const [isMounted, setIsMounted] = useState(false);
-  useEffect(() => {
-    setIsMounted(true);
-    // Signal to native that React is ready to receive events
-    (window as any).__FluxReady = true;
-  }, []);
 
   // ── SERVICE WORKER — skip on native ──────────────────────────────────────
   useEffect(() => {
@@ -888,16 +902,63 @@ export default function FluxChat() {
 
   const [auth, dispatchAuth] = useReducer(authReducer, authInit);
   const pendingSupabaseToken = useRef("");
-  const [token, setToken] = useState(() => typeof window === "undefined" ? "" : localStorage.getItem("chat_token") || "");
-  const [currentUser, setCurrentUser] = useState(() => typeof window === "undefined" ? "" : localStorage.getItem("chat_user") || "");
+  const [token, setToken] = useState("");
+  const [blockedUsers, setBlockedUsers] = useState<Set<string>>(new Set());
+  const [showBlockedList, setShowBlockedList] = useState(false);
+  const [currentUser, setCurrentUser] = useState("");
   const [profile, setProfile] = useState({ displayName: "", avatarUrl: "", username: "" });
   const isAuth = !!token;
   const tokenRef = useRef(token);
-  useEffect(() => { tokenRef.current = token; if (token) idbSet("chat_token", token); }, [token]);
+  useEffect(() => { tokenRef.current = token; }, [token]);
   const currentUserRef = useRef(currentUser);
   useEffect(() => { currentUserRef.current = currentUser; }, [currentUser]);
+  const blockedUsersRef = useRef(blockedUsers);
+  useEffect(() => { blockedUsersRef.current = blockedUsers; }, [blockedUsers]);
+  const e2ePrivKeyRef = useRef<CryptoKey | null>(null);
+  const e2ePubKeyB64Ref = useRef<string>("");
+  const pubKeyCache = useRef<Map<string, string>>(new Map());
   useEffect(() => { if (typeof document !== "undefined") document.body.classList.toggle("auth-mode", !isAuth); }, [isAuth]);
   const abortControllerRef = useRef<AbortController>(new AbortController());
+
+  const apiFetch = useCallback(async <T,>(path: string, opts: ApiOptions = {}): Promise<T> => {
+    const headers = new Headers(opts.headers as HeadersInit | undefined);
+    if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+    headers.set("ngrok-skip-browser-warning", "true");
+    if (tokenRef.current) headers.set("Authorization", `Bearer ${tokenRef.current}`);
+    const signal = opts.signal ?? abortControllerRef.current.signal;
+    const res = await fetch(`${API}${path}`, { ...opts, headers, signal });
+    if (!res.ok) { const body = await res.json().catch(() => ({ detail: "Request failed" })); throw new Error(body.detail || "Request failed"); }
+    return res.json();
+  }, []);
+
+  // ── Block state ──────────────────────────────────────────────────────────────
+  // Load blocked list on login
+  useEffect(() => {
+    if (!token) return;
+    apiFetch<{ email: string }[]>("/blocks")
+      .then(list => setBlockedUsers(new Set(list.map(b => b.email))))
+      .catch(() => {});
+  }, [token, apiFetch]);
+
+  const blockUser = async (targetEmail: string) => {
+    if (!window.confirm(`Block ${targetEmail}? They won't be able to message or call you.`)) return;
+    try {
+      await apiFetch(`/blocks/${encodeURIComponent(targetEmail)}`, { method: "POST" });
+      setBlockedUsers(prev => new Set([...prev, targetEmail]));
+      setContacts(prev => prev.filter(c => c.email !== targetEmail));
+      if (activeChat?.id === targetEmail) { setActiveChat(null); setMessages([]); }
+      showToast("User blocked", "success");
+      setShowContactProfile(false);
+    } catch (err) { showToast("Failed to block: " + errorMessage(err), "error"); }
+  };
+
+  const unblockUser = async (targetEmail: string) => {
+    try {
+      await apiFetch(`/blocks/${encodeURIComponent(targetEmail)}`, { method: "DELETE" });
+      setBlockedUsers(prev => { const n = new Set(prev); n.delete(targetEmail); return n; });
+      showToast("User unblocked", "success");
+    } catch (err) { showToast("Failed to unblock: " + errorMessage(err), "error"); }
+  };
 
   // ── SUPABASE PASSWORD RECOVERY LISTENER ──────────────────────────────────
   useEffect(() => {
@@ -919,23 +980,30 @@ export default function FluxChat() {
   const [inputMsg, setInputMsg] = useState("");
   const [hasMore, setHasMore] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
-  const [unread, setUnread] = useState<Record<string, number>>({});
+  const [unread, setUnread] = useState<Record<string, number>>(() => typeof window === "undefined" ? {} : safeParseJSON<Record<string, number>>(localStorage.getItem("cached_unread"), {}));
   const [lastActivity, setLastActivity] = useState<Record<string, number>>({});
   const [lastPreview, setLastPreview] = useState<Record<string, string>>({});
   const totalUnread = useMemo(() => Object.values(unread).reduce((sum, n) => sum + (n || 0), 0), [unread]);
+  useDebouncedLocalStorage(token ? "cached_unread" : "", unread, 1000);
 
   const [failedMsgIds, setFailedMsgIds] = useState<Set<string>>(new Set());
   const pendingTempTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const lastReplacedTempRef = useRef<string | null>(null);
 
-  const [deletedMsgIds, setDeletedMsgIds] = useState<Set<string>>(() => {
-    if (typeof window === "undefined") return new Set();
-    const u = localStorage.getItem("chat_user") || "";
-    const saved = u ? localStorage.getItem(`deleted_msgs_${u}`) : null;
-    return saved ? new Set<string>(safeParseJSON<string[]>(saved, [])) : new Set<string>();
-  });
-  const deletedMsgIdsRef = useRef(deletedMsgIds);
+  const [deletedMsgIds, setDeletedMsgIds] = useState<Set<string>>(() => new Set<string>());
+  const deletedMsgIdsRef = useRef<Set<string>>(new Set<string>());
   useEffect(() => { deletedMsgIdsRef.current = deletedMsgIds; }, [deletedMsgIds]);
+
+  const [toast, setToast] = useState<{ message: string; type: "success" | "error" | "info" } | null>(null);
+  const toastTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showToast = useCallback((message: string, type: "success" | "error" | "info" = "info") => {
+    if (toastTimeoutRef.current) clearTimeout(toastTimeoutRef.current);
+    setToast({ message, type });
+    toastTimeoutRef.current = setTimeout(() => {
+      setToast(null);
+      toastTimeoutRef.current = null;
+    }, 3000);
+  }, []);
   useEffect(() => {
     if (!currentUser) return;
     const saved = localStorage.getItem(`deleted_msgs_${currentUser}`);
@@ -952,6 +1020,9 @@ export default function FluxChat() {
   const [searchQuery, setSearchQuery] = useState("");
   const [wsStatus, setWsStatus] = useState<WsStatus>("disconnected");
   const [showEmojis, setShowEmojis] = useState(false);
+  const [focusedEmojiCoord, setFocusedEmojiCoord] = useState<{ r: number; c: number }>({ r: 0, c: 0 });
+  const emojiActiveCellRef = useRef<HTMLButtonElement | null>(null);
+  const emojiToggleRef = useRef<HTMLButtonElement | null>(null);
   const [showProfile, setShowProfile] = useState(false);
   const [showMyProfileSettings, setShowMyProfileSettings] = useState(false);
   const [ringtonePref, setRingtonePref] = useState("ringtone");
@@ -988,6 +1059,7 @@ export default function FluxChat() {
   const [sidebarDeleteId, setSidebarDeleteId] = useState<string | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [recordingDuration, setRecordingDuration] = useState(0);
+  const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const cancelRecordingRef = useRef(false);
   const [pendingFile, setPendingFile] = useState<{ file: File, url: string, type: "image" | "audio" | "video" | "pdf" | "file" } | null>(null);
@@ -1015,6 +1087,7 @@ export default function FluxChat() {
   const [isCameraOff, setIsCameraOff] = useState(false);
   const [remoteVideoMuted, setRemoteVideoMuted] = useState(false);
   const [remoteStreams, setRemoteStreams] = useState<Record<string, MediaStream>>({});
+  const [cameraStates, setCameraStates] = useState<Record<string, boolean>>({});
   const [pipPos, setPipPos] = useState({ x: 16, y: 100 });
   const pipDragging = useRef(false);
   const pipDragStart = useRef({ mx: 0, my: 0, x: 0, y: 0 });
@@ -1141,6 +1214,7 @@ export default function FluxChat() {
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const wsRetryDelay = useRef(800);
+  const wsRetryCount = useRef(0);
   const wsPingInterval = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastPongRef = useRef(Date.now());
   const pendingMessages = useRef<string[]>([]);
@@ -1151,7 +1225,7 @@ export default function FluxChat() {
   const pendingRemoteDescriptionRef = useRef<RTCSessionDescriptionInit | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const remoteStreamRef = useRef<MediaStream | null>(null);
-  const messagesCache = useRef<Record<string, Message[]>>({});
+  const [messagesCache, setMessagesCache] = useState<Record<string, Message[]>>({});
   const iceCandidateQueueRef = useRef<RTCIceCandidateInit[]>([]);          // kept for acceptCall drain (1-to-1)
   const iceQueuesRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());  // per-peer ICE queue (group)
   const pendingMeshOffersRef = useRef<Map<string, RTCSessionDescriptionInit>>(new Map()); // queued while ringing
@@ -1203,6 +1277,10 @@ export default function FluxChat() {
     if (persistSeenTimer.current) clearTimeout(persistSeenTimer.current);
     persistSeenTimer.current = setTimeout(() => {
       try {
+        if (seenMessageIds.current.size > 2000) {
+          const arr = [...seenMessageIds.current].slice(-1000);
+          seenMessageIds.current = new Set(arr);
+        }
         const arr = [...seenMessageIds.current].slice(-1000);
         sessionStorage.setItem("Flux_seen_ids", JSON.stringify(arr));
         localStorage.setItem("Flux_seen_ids_android", JSON.stringify({ ids: arr, ts: Date.now() }));
@@ -1217,16 +1295,65 @@ export default function FluxChat() {
       setLastPreview(prev => { const next = { ...prev, [id]: content }; if (currentUserRef.current) localStorage.setItem(`last_preview_${currentUserRef.current}`, JSON.stringify(next)); return next; });
   }, []);
 
-  const apiFetch = useCallback(async <T,>(path: string, opts: ApiOptions = {}): Promise<T> => {
-    const headers = new Headers(opts.headers as HeadersInit | undefined);
-    if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
-    headers.set("ngrok-skip-browser-warning", "true");
-    if (tokenRef.current) headers.set("Authorization", `Bearer ${tokenRef.current}`);
-    const signal = opts.signal ?? abortControllerRef.current.signal;
-    const res = await fetch(`${API}${path}`, { ...opts, headers, signal });
-    if (!res.ok) { const body = await res.json().catch(() => ({ detail: "Request failed" })); throw new Error(body.detail || "Request failed"); }
-    return res.json();
-  }, []);
+  const getPeerPubKey = useCallback(async (peerEmail: string): Promise<string | null> => {
+    if (pubKeyCache.current.has(peerEmail)) return pubKeyCache.current.get(peerEmail)!;
+    try {
+      const data = await apiFetch<{ public_key: string }>(`/profile/public-key/${encodeURIComponent(peerEmail)}`);
+      pubKeyCache.current.set(peerEmail, data.public_key);
+      return data.public_key;
+    } catch {
+      return null; // peer hasn't registered a key yet — fall back to plaintext
+    }
+  }, [apiFetch]);
+
+  const getGroupKey = useCallback(async (groupId: string | number): Promise<CryptoKey | null> => {
+    const gid = String(groupId);
+    if (groupKeyCache.has(gid)) return groupKeyCache.get(gid)!;
+
+    const privKey = e2ePrivKeyRef.current;
+    if (!privKey) return null;
+
+    try {
+      const data = await apiFetch<{
+        key_id: string;
+        encrypted_key: string;
+        setter_pub_key: string;
+      }>(`/groups/${gid}/e2e-key`);
+
+      const groupKey = await unwrapGroupKey(data.encrypted_key, privKey, data.setter_pub_key);
+      groupKeyCache.set(gid, groupKey);
+      return groupKey;
+    } catch {
+      return null; // no key distributed yet
+    }
+  }, [apiFetch]);
+
+  const decryptContent = useCallback(async (
+    content: string,
+    chatType: "user" | "group",
+    peerEmail: string,       // sender email for DMs, ignored for groups
+    groupId?: string | number,
+  ): Promise<string> => {
+    const privKey = e2ePrivKeyRef.current;
+    if (!privKey) return content;
+
+    try {
+      if (isDMEncrypted(content)) {
+        const theirPub = await getPeerPubKey(peerEmail);
+        if (!theirPub) return "[Encrypted — peer key unavailable]";
+        return await decryptDM(content, privKey, theirPub);
+      }
+      if (isGroupEncrypted(content) && groupId) {
+        const groupKey = await getGroupKey(groupId);
+        if (!groupKey) return "[Encrypted — group key unavailable]";
+        return await decryptGroupMsg(content, groupKey);
+      }
+    } catch (err) {
+      console.warn("[E2E] Decrypt failed:", err);
+      return "[Encrypted message — decryption failed]";
+    }
+    return content; // plaintext (legacy or from peer without E2E)
+  }, [getPeerPubKey, getGroupKey]);
 
   useEffect(() => {
     if (!token) return;
@@ -1238,7 +1365,6 @@ export default function FluxChat() {
         readChatsRef.current.forEach(cid => { merged[cid] = 0; });
         if (id) merged[id] = 0;
         setUnread(merged);
-        try { localStorage.setItem("cached_unread", JSON.stringify(merged)); } catch { }
       })
       .catch(() => { const cached = safeParseJSON<Record<string, number>>(localStorage.getItem("cached_unread"), {}); setUnread(cached); });
   }, [token]); // eslint-disable-line
@@ -1264,24 +1390,44 @@ export default function FluxChat() {
 
   const loadHistory = useCallback(async (chat: Chat, beforeId: string | number | null = null) => {
     if (!chat) return; setLoadingMore(true);
+    if (!beforeId) setIsLoadingHistory(true);
     try {
       const { type, id } = chat;
       const base = type === "user" ? `/messages/direct/${encodeURIComponent(id)}` : `/messages/group/${id}`;
       const rawHistory = await apiFetch<Message[]>(base + (beforeId ? `?before_id=${beforeId}` : ""));
       const history = applyPersistedDeletions(rawHistory);
+      const decryptedHistory = await Promise.all(
+        history.map(async m => {
+          if (!m.content || m.is_deleted || m._callRecord) return m;
+          const peerEmail = type === "user"
+            ? (m.user === currentUser ? String(id) : m.user)
+            : m.user;
+          const decContent = await decryptContent(m.content, type, peerEmail, type === "group" ? id : undefined);
+          return decContent !== m.content ? { ...m, content: decContent } : m;
+        })
+      );
       if (beforeId) {
-        const list = msgListRef.current; const prevScrollHeight = list ? list.scrollHeight : 0;
-        setMessages(prev => { const next = [...history, ...prev]; messagesCache.current[String(chat.id)] = next; return next; });
-        requestAnimationFrame(() => { if (list) list.scrollTop = list.scrollHeight - prevScrollHeight; });
+        const list = msgListRef.current;
+        const prevScrollHeight = list ? list.scrollHeight : 0;
+        const prevScrollTop = list ? list.scrollTop : 0;
+        setMessages(prev => { const next = [...decryptedHistory, ...prev]; setMessagesCache(cache => ({ ...cache, [String(chat.id)]: next })); return next; });
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            if (list) {
+              list.scrollTop = prevScrollTop + (list.scrollHeight - prevScrollHeight);
+            }
+          });
+        });
       } else {
-        setMessages(history); messagesCache.current[String(chat.id)] = history;
-        if (history.length > 0) updateActivity(id, history[history.length - 1].content);
+        setMessages(decryptedHistory); setMessagesCache(cache => ({ ...cache, [String(chat.id)]: decryptedHistory }));
+        if (decryptedHistory.length > 0) updateActivity(id, decryptedHistory[decryptedHistory.length - 1].content);
         setTimeout(scrollBottom, 100);
       }
-      setHasMore(history.length === 50);
+      setHasMore(decryptedHistory.length === 50);
     } catch { }
     setLoadingMore(false);
-  }, [apiFetch, scrollBottom, updateActivity, applyPersistedDeletions]);
+    if (!beforeId) setIsLoadingHistory(false);
+  }, [apiFetch, scrollBottom, updateActivity, applyPersistedDeletions, decryptContent, currentUser]);
 
   // ── NOTIFY (message) ──────────────────────────────────────────────────────
   const notify = useCallback((title: string, body: string, chatId?: string) => {
@@ -1297,7 +1443,7 @@ export default function FluxChat() {
     showCallNotification(title, body);
   }, []);
 
-  const markAllRead = useCallback(() => { setUnread({}); try { localStorage.setItem("cached_unread", JSON.stringify({})); } catch { } }, []);
+  const markAllRead = useCallback(() => { setUnread({}); }, []);
   const contactLabelFn = useCallback((c: Contact) => nicknames[c.email] || c.display_name || (c.username ? `@${c.username}` : null) || "Unknown User", [nicknames]);
   const contactLabel = contactLabelFn;
   const getPeerName = useCallback((email: string) => { const c = contacts.find(c => c.email === email); return c ? contactLabelFn(c) : "Unknown User"; }, [contacts, contactLabelFn]);
@@ -1384,23 +1530,37 @@ export default function FluxChat() {
       if (error) throw error;
       dispatchAuth({ type: "RESET" });
       dispatchAuth({ type: "SET_STEP", step: "signin" });
-      alert("Password updated! Sign in with your new password.");
+      showToast("Password updated! Sign in with your new password.", "success");
     } catch (e: any) {
       dispatchAuth({ type: "SET_ERROR", value: e.message || "Reset failed" });
     } finally { dispatchAuth({ type: "SET_LOADING", value: false }); }
   };
 
   const _finalizeAuth = (accessToken: string, email: string) => {
-    setToken(accessToken); setCurrentUser(email);
-    localStorage.setItem("chat_token", accessToken); localStorage.setItem("chat_user", email);
-    idbSet("chat_token", accessToken); pendingSupabaseToken.current = "";
+    setToken(accessToken);
+    setCurrentUser(email);
+    localStorage.setItem("chat_user", email);
+    pendingSupabaseToken.current = "";
     requestNotifyPermission();
-    // Register FCM token with backend for push notifications
     _registerFCMToken(accessToken);
-    // Start native background service for notifications when app is closed
     if (FluxNative) {
-      FluxNative.startService({ token: accessToken, wsUrl: API }).catch(() => { });
+      FluxNative.startService({ token: accessToken, wsUrl: API }).catch(() => {});
     }
+
+    // ── NEW: generate / load identity key pair, register public key ──────────
+    getOrCreateIdentityKeyPair(email).then(({ privateKey, publicKeyB64 }) => {
+      e2ePrivKeyRef.current  = privateKey;
+      e2ePubKeyB64Ref.current = publicKeyB64;
+
+      // Register with backend (idempotent — safe to call every login)
+      apiFetch("/profile/public-key", {
+        method: "POST",
+        body:   JSON.stringify({ public_key: publicKeyB64 }),
+      }).catch(() => {});
+    }).catch(err => {
+      console.warn("[E2E] Key init failed:", err);
+    });
+    // ── END NEW ───────────────────────────────────────────────────────────────
   };
 
   const _registerFCMToken = async (authToken: string) => {
@@ -1430,12 +1590,11 @@ export default function FluxChat() {
     setProfile({ displayName: "", avatarUrl: "", username: "" }); setNicknames({}); setLastActivity({}); setLastPreview({});
     dispatchAuth({ type: "RESET" }); setShowHeaderNicknameEdit(false); setShowContactProfile(false);
     setShowGroupProfile(false); setShowMyProfileSettings(false); setSearchQuery("");
-    localStorage.removeItem("chat_token"); localStorage.removeItem("chat_user");
+    localStorage.removeItem("chat_user");
     localStorage.removeItem("cached_contacts"); localStorage.removeItem("cached_groups");
     localStorage.removeItem("cached_unread"); localStorage.removeItem("cached_call_logs");
     localStorage.removeItem("Flux_seen_ids_android");
     try { sessionStorage.removeItem("Flux_seen_ids"); sessionStorage.removeItem("_Flux_call_offer"); } catch { }
-    idbSet("chat_token", "");
     if (wsRef.current) { wsRef.current.onclose = null; wsRef.current.close(); wsRef.current = null; }
     setWsStatus("disconnected"); seenMessageIds.current.clear();
   };
@@ -1444,17 +1603,17 @@ export default function FluxChat() {
     try {
       const body: any = {};
       if (editDisplayName.trim()) body.display_name = editDisplayName.trim();
-      if (editUsername.trim() && editUsername.trim() !== profile.username) { const u = editUsername.trim().toLowerCase(); if (!USERNAME_RE.test(u)) { alert("Invalid username format"); return; } body.username = u; }
+      if (editUsername.trim() && editUsername.trim() !== profile.username) { const u = editUsername.trim().toLowerCase(); if (!USERNAME_RE.test(u)) { showToast("Invalid username format", "error"); return; } body.username = u; }
       await apiFetch("/profile/me", { method: "PATCH", body: JSON.stringify(body) });
       setProfile(prev => ({ ...prev, displayName: editDisplayName.trim() || prev.displayName, username: body.username || prev.username }));
       setShowProfile(false); await loadProfile();
-    } catch (err) { alert("Failed to save profile: " + errorMessage(err)); }
+    } catch (err) { showToast("Failed to save profile: " + errorMessage(err), "error"); }
   };
 
   const handleAvatarUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]; if (!file) return; setIsUploadingAvatar(true);
     const form = new FormData(); form.append("file", file);
-    try { const res = await fetch(`${API}/upload`, { method: "POST", headers: { Authorization: `Bearer ${tokenRef.current}` }, body: form }); if (!res.ok) throw new Error("Upload failed"); const data = await res.json(); await apiFetch("/profile/me", { method: "PATCH", body: JSON.stringify({ avatar_url: data.url }) }); setProfile(prev => ({ ...prev, avatarUrl: data.url })); } catch { alert("Avatar upload failed"); }
+    try { const res = await fetch(`${API}/upload`, { method: "POST", headers: { Authorization: `Bearer ${tokenRef.current}` }, body: form }); if (!res.ok) throw new Error("Upload failed"); const data = await res.json(); await apiFetch("/profile/me", { method: "PATCH", body: JSON.stringify({ avatar_url: data.url }) }); setProfile(prev => ({ ...prev, avatarUrl: data.url })); } catch { showToast("Avatar upload failed", "error"); }
     finally { setIsUploadingAvatar(false); }
   };
 
@@ -1462,7 +1621,7 @@ export default function FluxChat() {
     if (!activeChat || activeChat.type !== "group") return;
     const file = e.target.files?.[0]; if (!file) return; setIsUploadingGroupAvatar(true);
     const form = new FormData(); form.append("file", file);
-    try { const res = await fetch(`${API}/upload`, { method: "POST", headers: { Authorization: `Bearer ${tokenRef.current}` }, body: form }); if (!res.ok) throw new Error("Upload failed"); const data = await res.json(); localStorage.setItem(`group_avatar_${activeChat.id}`, data.url); setGroups(prev => prev.map(g => g.id === activeChat.id ? { ...g, avatar_url: data.url } : g)); } catch (err) { alert("Group avatar upload failed: " + errorMessage(err)); }
+    try { const res = await fetch(`${API}/upload`, { method: "POST", headers: { Authorization: `Bearer ${tokenRef.current}` }, body: form }); if (!res.ok) throw new Error("Upload failed"); const data = await res.json(); localStorage.setItem(`group_avatar_${activeChat.id}`, data.url); setGroups(prev => prev.map(g => g.id === activeChat.id ? { ...g, avatar_url: data.url } : g)); } catch (err) { showToast("Group avatar upload failed: " + errorMessage(err), "error"); }
     finally { setIsUploadingGroupAvatar(false); e.target.value = ""; }
   };
 
@@ -1476,18 +1635,52 @@ export default function FluxChat() {
         try {
           const prof = await apiFetch<{ email: string }>(`/profile/by-username/${encodeURIComponent(uname)}`);
           memberEmail = prof.email;
-        } catch { memberEmail = uname; }
+        } catch {
+          showToast(`Username not found: @${uname}`, "error");
+          return;
+        }
       }
       await apiFetch(`/groups/${activeChat.id}/members?member_email=${encodeURIComponent(memberEmail)}`, { method: "POST" });
+      
+      // Wrap and upload group key for the new member
+      try {
+        const privKey  = e2ePrivKeyRef.current;
+        const myPubB64 = e2ePubKeyB64Ref.current;
+        const gid      = String(activeChat.id);
+        const existingKey = groupKeyCache.get(gid);
+
+        if (privKey && myPubB64 && existingKey) {
+          const newMemberPub = await getPeerPubKey(memberEmail);
+          if (newMemberPub) {
+            const keyId  = crypto.randomUUID();
+            const encKey = await wrapGroupKeyForMember(
+              { keyId, groupKey: existingKey },
+              privKey,
+              newMemberPub,
+            );
+            await apiFetch(`/groups/${activeChat.id}/e2e-key`, {
+              method: "POST",
+              body: JSON.stringify({
+                key_id:         keyId,
+                setter_pub_key: myPubB64,
+                member_keys:    [{ email: memberEmail, encrypted_key: encKey }],
+              }),
+            });
+          }
+        }
+      } catch (err) {
+        console.warn("[E2E] New member key wrap failed:", err);
+      }
+
       setNewGroupMemberSearchInput(""); await loadGroups();
     }
-    catch (err) { alert("Failed to add member: " + errorMessage(err)); }
+    catch (err) { showToast("Failed to add member: " + errorMessage(err), "error"); }
   };
 
   const addContactByUsername = async (username: string) => {
     if (!username.trim()) return;
     try { const res = await apiFetch<{ email: string; username: string; message: string }>("/contacts", { method: "POST", body: JSON.stringify({ username: username.trim().toLowerCase() }) }); await loadContacts(); const prof = await apiFetch<Contact>(`/profile/by-username/${username.trim().toLowerCase()}`); openChat({ type: "user", id: res.email, name: prof.display_name || prof.username || "Unknown User" }); }
-    catch (err) { alert("Could not find user: " + errorMessage(err)); }
+    catch (err) { showToast("Could not find user: " + errorMessage(err), "error"); }
   };
 
   const saveContactNickname = (email: string, nickname: string) => {
@@ -1505,7 +1698,7 @@ export default function FluxChat() {
 
   const deleteChat = useCallback((type: "user" | "group", id: string | number) => {
     const sid = String(id); setSidebarDeleteId(null);
-    delete messagesCache.current[sid];
+    setMessagesCache(cache => { const next = { ...cache }; delete next[sid]; return next; });
     setLastActivity(prev => { const n = { ...prev }; delete n[sid]; return n; });
     setLastPreview(prev => { const n = { ...prev }; delete n[sid]; return n; });
     setUnread(prev => { const n = { ...prev }; delete n[sid]; return n; });
@@ -1548,15 +1741,15 @@ export default function FluxChat() {
     setActiveChat(chat); setShowHeaderNicknameEdit(false); setShowContactProfile(false);
     setShowGroupProfile(false); setSearchQuery(""); setReplyingTo(null);
     setReactionPickerId(null); setSelectedMsgId(null); setSidebarDeleteId(null);
-    if (messagesCache.current[chatId]) { setMessages(messagesCache.current[chatId]); setTimeout(scrollBottom, 10); }
+    if (messagesCache[chatId]) { setMessages(messagesCache[chatId]); setTimeout(scrollBottom, 10); }
     else { setMessages([]); }
     setHasMore(false); setShowEmojis(false); setEditingId(null);
     addToReadChats(chatId);
-    setUnread(prev => { const next = { ...prev, [chatId]: 0 }; try { localStorage.setItem("cached_unread", JSON.stringify(next)); } catch { } return next; });
+    setUnread(prev => ({ ...prev, [chatId]: 0 }));
     sendReadReceipt(chat);
     await loadHistory(chat);
-    setMessages(prev => { const next = prev.map(m => m.user !== currentUser && !m.is_read ? { ...m, is_read: true } : m); messagesCache.current[chatId] = next; return next; });
-  }, [scrollBottom, loadHistory, apiFetch, currentUser, sendReadReceipt]);
+    setMessages(prev => { const next = prev.map(m => m.user !== currentUser && !m.is_read ? { ...m, is_read: true } : m); setMessagesCache(cache => ({ ...cache, [chatId]: next })); return next; });
+  }, [scrollBottom, loadHistory, apiFetch, currentUser, sendReadReceipt, messagesCache]);
   useEffect(() => { openChatRef.current = openChat; }, [openChat]);
 
   useEffect(() => {
@@ -1650,7 +1843,7 @@ export default function FluxChat() {
       const recordContent = `${icon} ${dirLabel} ${callTypeLabel}${statusLabel}`;
       const callRecord: Message = { id: `call-${Date.now()}-${Math.random()}`, user: currentUserRef.current, content: recordContent, timestamp: new Date().toISOString(), _callRecord: true };
       const targetChatId = activeChatRef.current ? String(activeChatRef.current.id) : cp || "";
-      if (targetChatId) setMessages(prev => { const next = [...prev, callRecord]; messagesCache.current[targetChatId] = next; return next; });
+      if (targetChatId) setMessages(prev => { const next = [...prev, callRecord]; setMessagesCache(cache => ({ ...cache, [targetChatId]: next })); return next; });
       setTimeout(scrollBottom, 50);
     }
     if (sendSignal && wsRef.current?.readyState === WebSocket.OPEN) {
@@ -1665,7 +1858,7 @@ export default function FluxChat() {
     if (remoteAudioRef.current) remoteAudioRef.current.srcObject = null;
     peerConnectionRef.current = null; pendingRemoteDescriptionRef.current = null;
     localStreamRef.current = null; remoteStreamRef.current = null; iceCandidateQueueRef.current = []; iceQueuesRef.current.clear(); pendingMeshOffersRef.current.clear();
-    setRemoteStreams({}); updateCallState("idle"); setCallPeer(null); setCallPeerName("");
+    setRemoteStreams({}); setCameraStates({}); updateCallState("idle"); setCallPeer(null); setCallPeerName("");
     setIsMuted(false); setIsSpeaker(true); setIsCameraOff(false); setRemoteVideoMuted(false); setFacingMode("user"); setCallDuration(0); setIsVideoSwapped(false);
     callStartTimeRef.current = null; callDirectionRef.current = null; isVideoCallRef.current = false; setPipPos({ x: 16, y: 100 });
   }, [updateCallState, stopRingtone, scrollBottom, getPeerName, apiFetch]); // eslint-disable-line
@@ -1712,7 +1905,9 @@ export default function FluxChat() {
     const ws = new WebSocket(`${WS_URL}/ws?token=${encodeURIComponent(currentToken)}`);
     wsRef.current = ws;
     ws.onopen = () => {
-      wsRetryDelay.current = 800; setWsStatus("connected");
+      wsRetryDelay.current = 800;
+      wsRetryCount.current = 0;
+      setWsStatus("connected");
       // FIX: Pre-warm audio on every WS connect (not just first user interaction)
       if (!IS_NATIVE && ringtoneRef.current) {
         ringtoneRef.current.load();
@@ -1771,7 +1966,6 @@ export default function FluxChat() {
           // Respect chats already manually read this session
           readChatsRef.current.forEach(cid => { merged[cid] = 0; });
           if (id) merged[id] = 0;
-          try { localStorage.setItem("cached_unread", JSON.stringify(merged)); } catch { }
           return merged;
         });
       }).catch(() => { });
@@ -1788,9 +1982,22 @@ export default function FluxChat() {
     };
     ws.onclose = () => {
       if (wsPingInterval.current) { clearInterval(wsPingInterval.current); wsPingInterval.current = null; }
+      if (!tokenRef.current) {
+        setWsStatus("disconnected");
+        return;
+      }
+      if (wsRetryCount.current >= 10) {
+        console.warn("[WS] Reconnection failed after 10 retries. Setting offline mode.");
+        setWsStatus("offline");
+        return;
+      }
       setWsStatus("disconnected");
-      if (!tokenRef.current) return;
-      setTimeout(() => { wsRetryDelay.current = Math.min(wsRetryDelay.current * 1.5, 5000); setWsStatus("reconnecting"); initWSRef.current?.(); }, wsRetryDelay.current);
+      wsRetryCount.current += 1;
+      setTimeout(() => {
+        wsRetryDelay.current = Math.min(wsRetryDelay.current * 1.5, 5000);
+        setWsStatus("reconnecting");
+        initWSRef.current?.();
+      }, wsRetryDelay.current);
     };
     ws.onmessage = ({ data: raw }) => {
       // Pong handling is inline for minimal latency
@@ -1815,7 +2022,18 @@ export default function FluxChat() {
       case "direct_message": {
         setTypingSet(prev => { const n = new Set(prev); n.delete(String(data.user)); return n; });
         const peer = data.user === me ? (data.receiver_email || data.target_user) : data.user; if (!peer) break;
-        const msg = data as Message; const dmId = String(msg.id);
+        if (data.user !== me && blockedUsersRef.current.has(String(data.user))) break;
+
+        const rawMsg = data as Message;
+        const dmPeer = data.user === me ? String(data.receiver_email || data.target_user) : String(data.user);
+        const decryptedDMContent = await decryptContent(
+          rawMsg.content,
+          "user",
+          dmPeer,
+        );
+        const msg = { ...rawMsg, content: decryptedDMContent };
+
+        const dmId = String(msg.id);
         if (!dmId.startsWith("temp-") && seenMessageIds.current.has(dmId)) break;
         if (!dmId.startsWith("temp-")) { seenMessageIds.current.add(dmId); persistSeenIds(); }
         updateActivity(String(peer), msg.content);
@@ -1846,19 +2064,44 @@ export default function FluxChat() {
               if (idx !== -1) { lastReplacedTempRef.current = String(prev[idx].id); next = [...prev]; next[idx] = msg; }
               else if (!prev.find(m => String(m.id) === String(msg.id))) next = [...prev, msg];
             } else if (!prev.find(m => String(m.id) === String(msg.id))) next = [...prev, msg];
-            messagesCache.current[String(peer)] = next; return next;
+            setMessagesCache(cache => ({ ...cache, [String(peer)]: next })); return next;
           });
           const replacedId = lastReplacedTempRef.current;
           if (replacedId) { const t = pendingTempTimers.current.get(replacedId); if (t) { clearTimeout(t); pendingTempTimers.current.delete(replacedId); } setFailedMsgIds(prev => { const n = new Set(prev); n.delete(replacedId); return n; }); }
           setTimeout(scrollBottom, 50);
           if (data.user !== me && currentActiveDM) sendReadReceipt(currentActiveDM);
-        } else if (data.user !== me) {
-          setUnread(prev => { const next = { ...prev, [String(peer)]: (prev[String(peer)] || 0) + 1 }; try { localStorage.setItem("cached_unread", JSON.stringify(next)); } catch { } return next; });
-          notify((data.sender_name as string) || "New message", msg.content.startsWith("[") ? "📎 Attachment" : msg.content, String(peer));
+        } else {
+          setMessagesCache(prev => {
+            const currentList = prev[String(peer)];
+            if (!currentList) return prev;
+            if (currentList.find(m => String(m.id) === String(msg.id))) return prev;
+            let nextList = currentList;
+            if (data.user === me) {
+              const idx = currentList.findIndex(m => String(m.id).startsWith("temp-") && m.content === msg.content);
+              if (idx !== -1) { nextList = [...currentList]; nextList[idx] = msg; }
+              else { nextList = [...currentList, msg]; }
+            } else {
+              nextList = [...currentList, msg];
+            }
+            return { ...prev, [String(peer)]: nextList };
+          });
+          if (data.user !== me) {
+            setUnread(prev => ({ ...prev, [String(peer)]: (prev[String(peer)] || 0) + 1 }));
+            notify((data.sender_name as string) || "New message", msg.content.startsWith("[") ? "📎 Attachment" : msg.content, String(peer));
+          }
         }
         break;
       }
       case "group_message": {
+        const rawGMsg = data as Message;
+        const decryptedGContent = await decryptContent(
+          rawGMsg.content,
+          "group",
+          String(rawGMsg.user),
+          rawGMsg.group_id,
+        );
+        const msg = { ...rawGMsg, content: decryptedGContent };
+
         updateActivity(String(data.group_id), String(data.content || ""));
         const gmId = String((data as any).id);
         if (gmId && !gmId.startsWith("temp-") && seenMessageIds.current.has(gmId)) break;
@@ -1868,32 +2111,68 @@ export default function FluxChat() {
         if (isInGroupChat) {
           lastReplacedTempRef.current = null;
           setMessages(prev => {
-            let next = prev; const msg = data as Message;
+            let next = prev;
             if (data.user === me) {
               const idx = prev.findIndex(m => String(m.id).startsWith("temp-") && m.content === msg.content);
               if (idx !== -1) { lastReplacedTempRef.current = String(prev[idx].id); next = [...prev]; next[idx] = msg; }
               else if (!prev.find(m => String(m.id) === String(msg.id))) next = [...prev, msg];
             } else if (!prev.find(m => String(m.id) === String(msg.id))) next = [...prev, msg];
-            messagesCache.current[String(data.group_id)] = next; return next;
+            setMessagesCache(cache => ({ ...cache, [String(data.group_id)]: next })); return next;
           });
           const replacedId = lastReplacedTempRef.current;
           if (replacedId) { const t = pendingTempTimers.current.get(replacedId); if (t) { clearTimeout(t); pendingTempTimers.current.delete(replacedId); } setFailedMsgIds(prev => { const n = new Set(prev); n.delete(replacedId); return n; }); }
           setTimeout(scrollBottom, 50);
-        } else if (data.user !== me) {
-          setUnread(prev => { const next = { ...prev, [String(data.group_id)]: (prev[String(data.group_id)] || 0) + 1 }; try { localStorage.setItem("cached_unread", JSON.stringify(next)); } catch { } return next; });
-          notify(`${data.group_name}`, `${data.sender_name || "Someone"}: ${data.content}`, String(data.group_id));
+        } else {
+          setMessagesCache(prev => {
+            const currentList = prev[String(data.group_id)];
+            if (!currentList) return prev;
+            if (currentList.find(m => String(m.id) === String(msg.id))) return prev;
+            let nextList = currentList;
+            if (data.user === me) {
+              const idx = currentList.findIndex(m => String(m.id).startsWith("temp-") && m.content === msg.content);
+              if (idx !== -1) { nextList = [...currentList]; nextList[idx] = msg; }
+              else { nextList = [...currentList, msg]; }
+            } else {
+              nextList = [...currentList, msg];
+            }
+            return { ...prev, [String(data.group_id)]: nextList };
+          });
+          if (data.user !== me) {
+            setUnread(prev => ({ ...prev, [String(data.group_id)]: (prev[String(data.group_id)] || 0) + 1 }));
+            notify(`${data.group_name}`, `${data.sender_name || "Someone"}: ${msg.content.startsWith("[") ? "📎 Attachment" : msg.content}`, String(data.group_id));
+          }
         }
         break;
       }
       case "reaction": setMessages(prev => prev.map(m => { if (String(m.id) === String(data.message_id)) { if (data.reactions && typeof data.reactions === "object") return { ...m, reactions: data.reactions as Record<string, string[]> }; const current = m.reactions || {}; const users = current[data.emoji as string] || []; if (!users.includes(String(data.user))) return { ...m, reactions: { ...current, [data.emoji as string]: [...users, String(data.user)] } }; } return m; })); break;
       case "read_receipt": setMessages(prev => prev.map(m => { if (m.user === me) { if (data.group_id && m.group_id === data.group_id) { const rb = m.read_by || []; if (!rb.includes(String(data.user))) return { ...m, is_read: true, read_by: [...rb, String(data.user)] }; } else if (!data.group_id && !m.group_id) return { ...m, is_read: true }; } return m; })); break;
-      case "message_edited": setMessages(prev => prev.map(m => String(m.id) === String(data.id) ? { ...m, content: String(data.content || ""), edited_at: data.edited_at as string } : m)); break;
+      case "message_edited": {
+        const rawMsg = data as Message;
+        const chatType = data.group_id ? "group" : "user";
+        const peerEmail = chatType === "user"
+          ? (data.user === me ? String(data.receiver_email || data.target_user) : String(data.user))
+          : String(data.user);
+        const decryptedContent = await decryptContent(
+          rawMsg.content,
+          chatType,
+          peerEmail,
+          data.group_id ? String(data.group_id) : undefined
+        );
+        setMessages(prev => prev.map(m => String(m.id) === String(data.id) ? { ...m, content: decryptedContent, edited_at: data.edited_at as string } : m));
+        break;
+      }
       case "message_deleted": setMessages(prev => prev.map(m => String(m.id) === String(data.id) ? { ...m, is_deleted: true } : m)); break;
       case "presence": setContacts(prev => prev.map(c => c.email === data.user ? { ...c, is_online: Boolean(data.online) } : c)); break;
 
       // ── FIX: call_offer — all synchronous UI work happens FIRST, no async before ringtone ──
       case "call_offer": {
         const callerEmail = String(data.user || "");
+        if (blockedUsersRef.current.has(callerEmail)) {
+          if (wsRef.current?.readyState === WebSocket.OPEN) {
+            wsRef.current.send(JSON.stringify({ type: "call_reject", target_user: callerEmail }));
+          }
+          break;
+        }
         const vid = Boolean(data.isVideo);
         const sdpObj = (data.sdp && typeof data.sdp === "object") ? data.sdp as any : {};
         const isMesh = Boolean(data.is_mesh || sdpObj.is_mesh);
@@ -1982,7 +2261,14 @@ export default function FluxChat() {
 
       case "call_answer": { const peer = String(data.user); const pc = pcMapRef.current.get(peer) || peerConnectionRef.current; if (pc) { await pc.setRemoteDescription(new RTCSessionDescription(data.sdp as RTCSessionDescriptionInit)); updateCallState("connected"); callStartTimeRef.current = Date.now(); const queue = iceQueuesRef.current.get(peer) || []; while (queue.length > 0) { const c = queue.shift(); if (c) await pc.addIceCandidate(new RTCIceCandidate(c)).catch(console.error); } iceQueuesRef.current.set(peer, queue); } break; }
       case "ice_candidate": { const peer = String(data.user); const pc = pcMapRef.current.get(peer) || peerConnectionRef.current; if (pc && pc.remoteDescription) { await pc.addIceCandidate(new RTCIceCandidate(data.candidate as RTCIceCandidateInit)).catch(console.error); } else { const queue = iceQueuesRef.current.get(peer) || []; queue.push(data.candidate as RTCIceCandidateInit); iceQueuesRef.current.set(peer, queue); } break; }
-      case "camera_state": { setRemoteVideoMuted(data.videoMuted === true); break; }
+      case "camera_state": {
+        const u = String(data.user || "");
+        setRemoteVideoMuted(data.videoMuted === true);
+        if (u) {
+          setCameraStates(prev => ({ ...prev, [u]: data.videoMuted === true }));
+        }
+        break;
+      }
       case "call_end": {
         const leavingPeer = String(data.user || "");
         const inGroupCall = !!callGroupIdRef.current;
@@ -2024,6 +2310,35 @@ export default function FluxChat() {
   useEffect(() => { wsHandlerRef.current = wsHandler; }, [wsHandler]);
 
   useEffect(() => { initWSRef.current = initWS; }, [initWS]);
+
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        const { data: { session } } = await supabase.auth.getSession();
+        if (session?.access_token) {
+          const res = await apiFetch<{ access_token: string; user: any }>("/auth/login", {
+            method: "POST",
+            body: JSON.stringify({ id_token: session.access_token }),
+          });
+          _finalizeAuth(res.access_token, res.user.email);
+        }
+      } catch (err) {
+        console.warn("[Auth] Session auto-login failed:", err);
+      } finally {
+        setIsMounted(true);
+        // Signal to native that React is ready to receive events
+        (window as any).__FluxReady = true;
+      }
+    };
+
+    initAuth();
+
+    // ── OTA UPDATE CHECK ────────────────────────────────────────────────────
+    // Fire-and-forget — errors caught inside, never blocks the app
+    initOTAUpdater();
+    // ── END OTA ─────────────────────────────────────────────────────────────
+
+  }, [apiFetch]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const acceptCallRef = useRef<() => void>(() => { });
   const rejectCallRef = useRef<() => void>(() => { });
@@ -2161,23 +2476,35 @@ export default function FluxChat() {
     if (!activeChat) return;
 
     if (pendingFile) {
+      const originalPendingFile = pendingFile;
       const { file, type } = pendingFile;
       setPendingFile(null);
       setIsUploadingAttachment(true);
       const form = new FormData(); form.append("file", file);
       try {
         const res = await fetch(`${API}/upload`, { method: "POST", headers: { Authorization: `Bearer ${tokenRef.current}` }, body: form });
-        if (!res.ok) { alert("Upload failed"); setIsUploadingAttachment(false); return; }
+        if (!res.ok) {
+          showToast("Upload failed", "error");
+          setPendingFile(originalPendingFile);
+          setIsUploadingAttachment(false);
+          return;
+        }
         const data = await res.json();
         const tag = type === "image" ? `[IMAGE]${data.url}` : type === "audio" ? `[AUDIO]${data.url}` : type === "video" ? `[VIDEO]${data.url}` : type === "pdf" ? `[PDF]${data.url}` : `[FILE]${data.url}`;
         const { type: chatType, id } = activeChat;
         const tempId = `temp-${Date.now()}-${Math.random()}`;
         const optimisticMsg: Message = { id: tempId, user: currentUser, content: tag, timestamp: new Date().toISOString(), ...(chatType === "user" ? { target_user: String(id) } : { group_id: id, group_name: activeChat.name }), ...(replyingTo ? { reply_to_id: replyingTo.id, reply_to_content: replyingTo.content } : {}) };
-        setMessages(prev => { const next = [...prev, optimisticMsg]; messagesCache.current[String(id)] = next; return next; });
+        setMessages(prev => { const next = [...prev, optimisticMsg]; setMessagesCache(cache => ({ ...cache, [String(id)]: next })); return next; });
         updateActivity(id, tag); setTimeout(scrollBottom, 50);
+
         wsRef.current?.send(JSON.stringify({ type: chatType === "user" ? "direct_message" : "group_message", content: tag, message_type: type, ...(chatType === "user" ? { target_user: id } : { group_id: id }), ...(replyingTo ? { reply_to_id: replyingTo.id, reply_to_content: replyingTo.content } : {}) }));
         setReplyingTo(null);
-      } catch { }
+      } catch {
+        showToast("Upload failed due to network error", "error");
+        setPendingFile(originalPendingFile);
+        setIsUploadingAttachment(false);
+        return;
+      }
       setIsUploadingAttachment(false);
       if (!text) return;
     }
@@ -2190,15 +2517,37 @@ export default function FluxChat() {
       ...(type === "user" ? { target_user: String(id) } : { group_id: id, group_name: activeChat.name }),
       ...(replyingTo ? { reply_to_id: replyingTo.id, reply_to_content: replyingTo.content } : {}),
     };
-    setMessages(prev => { const next = [...prev, optimisticMsg]; messagesCache.current[String(id)] = next; return next; });
+    setMessages(prev => { const next = [...prev, optimisticMsg]; setMessagesCache(cache => ({ ...cache, [String(id)]: next })); return next; });
     updateActivity(id, text); setTimeout(scrollBottom, 50);
     const failTimer = setTimeout(() => { setFailedMsgIds(prev => new Set(prev).add(tempId)); pendingTempTimers.current.delete(tempId); }, 25000);
     pendingTempTimers.current.set(tempId, failTimer);
-    wsSend(JSON.stringify({ type: type === "user" ? "direct_message" : "group_message", content: text, message_type: "text", ...(type === "user" ? { target_user: id } : { group_id: id }), ...(replyingTo ? { reply_to_id: replyingTo.id, reply_to_content: replyingTo.content } : {}) }));
+
+    let contentToSend = text;
+    if (type === "user" && e2ePrivKeyRef.current) {
+      const theirPub = await getPeerPubKey(String(id));
+      if (theirPub) {
+        try {
+          contentToSend = await encryptDM(text, e2ePrivKeyRef.current, theirPub);
+        } catch (err) {
+          console.warn("[E2E] DM encrypt failed, sending plaintext:", err);
+        }
+      }
+    } else if (type === "group" && e2ePrivKeyRef.current) {
+      const groupKey = await getGroupKey(id);
+      if (groupKey) {
+        try {
+          contentToSend = await encryptGroupMsg(text, groupKey);
+        } catch (err) {
+          console.warn("[E2E] Group encrypt failed, sending plaintext:", err);
+        }
+      }
+    }
+
+    wsSend(JSON.stringify({ type: type === "user" ? "direct_message" : "group_message", content: contentToSend, message_type: "text", ...(type === "user" ? { target_user: id } : { group_id: id }), ...(replyingTo ? { reply_to_id: replyingTo.id, reply_to_content: replyingTo.content } : {}) }));
     setReplyingTo(null);
   };
 
-  const retryMessage = useCallback((msg: Message) => {
+  const retryMessage = useCallback(async (msg: Message) => {
     if (!activeChat) return;
     const tid = String(msg.id);
     setFailedMsgIds(prev => { const n = new Set(prev); n.delete(tid); return n; });
@@ -2206,11 +2555,34 @@ export default function FluxChat() {
     if (existing) { clearTimeout(existing); pendingTempTimers.current.delete(tid); }
     const newTempId = `temp-${Date.now()}-${Math.random()}`;
     const newTemp: Message = { ...msg, id: newTempId, timestamp: new Date().toISOString() };
-    setMessages(prev => { const next = prev.map(m => String(m.id) === tid ? newTemp : m); messagesCache.current[String(activeChat.id)] = next; return next; });
+    setMessages(prev => { const next = prev.map(m => String(m.id) === tid ? newTemp : m); setMessagesCache(cache => ({ ...cache, [String(activeChat.id)]: next })); return next; });
     const failTimer = setTimeout(() => { setFailedMsgIds(prev => new Set(prev).add(newTempId)); pendingTempTimers.current.delete(newTempId); }, 10000);
     pendingTempTimers.current.set(newTempId, failTimer);
-    wsSend(JSON.stringify({ type: activeChat.type === "user" ? "direct_message" : "group_message", content: msg.content, message_type: "text", ...(activeChat.type === "user" ? { target_user: activeChat.id } : { group_id: activeChat.id }) }));
-  }, [activeChat, wsSend]);
+
+    let contentToSend = msg.content;
+    const { type, id } = activeChat;
+    if (type === "user" && e2ePrivKeyRef.current) {
+      const theirPub = await getPeerPubKey(String(id));
+      if (theirPub) {
+        try {
+          contentToSend = await encryptDM(msg.content, e2ePrivKeyRef.current, theirPub);
+        } catch (err) {
+          console.warn("[E2E] DM encrypt failed, sending plaintext:", err);
+        }
+      }
+    } else if (type === "group" && e2ePrivKeyRef.current) {
+      const groupKey = await getGroupKey(id);
+      if (groupKey) {
+        try {
+          contentToSend = await encryptGroupMsg(msg.content, groupKey);
+        } catch (err) {
+          console.warn("[E2E] Group encrypt failed, sending plaintext:", err);
+        }
+      }
+    }
+
+    wsSend(JSON.stringify({ type: activeChat.type === "user" ? "direct_message" : "group_message", content: contentToSend, message_type: "text", ...(activeChat.type === "user" ? { target_user: activeChat.id } : { group_id: activeChat.id }) }));
+  }, [activeChat, wsSend, getPeerPubKey, getGroupKey]);
 
   const sendReaction = useCallback((msgId: string | number, emoji: string) => {
     if (!activeChat) return; setReactionPickerId(null); setSelectedMsgId(null);
@@ -2219,7 +2591,34 @@ export default function FluxChat() {
 
   const saveEdit = async () => {
     if (!editingId || !activeChat) return;
-    try { await apiFetch<void>(`/messages/${editingId}`, { method: "PATCH", body: JSON.stringify({ content: editingText }) }); setMessages(prev => prev.map(m => m.id === editingId ? { ...m, content: editingText, edited_at: new Date().toISOString() } : m)); setEditingId(null); setEditingText(""); } catch { }
+    let contentToSend = editingText;
+    const { type, id } = activeChat;
+    if (type === "user" && e2ePrivKeyRef.current) {
+      const theirPub = await getPeerPubKey(String(id));
+      if (theirPub) {
+        try {
+          contentToSend = await encryptDM(editingText, e2ePrivKeyRef.current, theirPub);
+        } catch (err) {
+          console.warn("[E2E] DM encrypt failed, sending plaintext:", err);
+        }
+      }
+    } else if (type === "group" && e2ePrivKeyRef.current) {
+      const groupKey = await getGroupKey(id);
+      if (groupKey) {
+        try {
+          contentToSend = await encryptGroupMsg(editingText, groupKey);
+        } catch (err) {
+          console.warn("[E2E] Group encrypt failed, sending plaintext:", err);
+        }
+      }
+    }
+
+    try {
+      await apiFetch<void>(`/messages/${editingId}`, { method: "PATCH", body: JSON.stringify({ content: contentToSend }) });
+      setMessages(prev => prev.map(m => m.id === editingId ? { ...m, content: editingText, edited_at: new Date().toISOString() } : m));
+      setEditingId(null);
+      setEditingText("");
+    } catch { }
   };
 
   const deleteMsg = async (id: string | number) => {
@@ -2228,7 +2627,7 @@ export default function FluxChat() {
       const t = pendingTempTimers.current.get(tid);
       if (t) { clearTimeout(t); pendingTempTimers.current.delete(tid); }
       setFailedMsgIds(prev => { const n = new Set(prev); n.delete(tid); return n; });
-      setMessages(prev => { const next = prev.filter(m => String(m.id) !== tid); messagesCache.current[String(activeChat?.id || "")] = next; return next; });
+      setMessages(prev => { const next = prev.filter(m => String(m.id) !== tid); setMessagesCache(cache => ({ ...cache, [String(activeChat?.id || "")]: next })); return next; });
       return;
     }
     try { await apiFetch<void>(`/messages/${id}`, { method: "DELETE" }); setMessages(prev => prev.map(m => m.id === id ? { ...m, is_deleted: true } : m)); setDeletedMsgIds(prev => { const next = new Set(prev); next.add(String(id)); if (currentUserRef.current) localStorage.setItem(`deleted_msgs_${currentUserRef.current}`, JSON.stringify([...next])); deletedMsgIdsRef.current = next; return next; }); } catch { }
@@ -2282,16 +2681,21 @@ export default function FluxChat() {
           return;
         }
         const blob = new Blob(audioChunksRef.current, { type: "audio/webm" }); const form = new FormData(); form.append("file", blob, "voice.webm");
-        const res = await fetch(`${API}/upload`, { method: "POST", headers: { Authorization: `Bearer ${tokenRef.current}` }, body: form });
-        const data = await res.json(); const tag = `[AUDIO]${data.url}`;
-        const { type, id } = activeChat;
-        const optimisticMsg: Message = { id: `temp-${Date.now()}-${Math.random()}`, user: currentUser, content: tag, timestamp: new Date().toISOString(), ...(type === "user" ? { target_user: String(id) } : { group_id: id, group_name: activeChat.name }) };
-        setMessages(prev => { const next = [...prev, optimisticMsg]; messagesCache.current[String(id)] = next; return next; });
-        setTimeout(scrollBottom, 50);
-        wsRef.current?.send(JSON.stringify({ type: type === "user" ? "direct_message" : "group_message", content: tag, message_type: "audio", ...(type === "user" ? { target_user: id } : { group_id: id }) }));
+        try {
+          const res = await fetch(`${API}/upload`, { method: "POST", headers: { Authorization: `Bearer ${tokenRef.current}` }, body: form });
+          if (!res.ok) throw new Error("Upload failed");
+          const data = await res.json(); const tag = `[AUDIO]${data.url}`;
+          const { type, id } = activeChat;
+          const optimisticMsg: Message = { id: `temp-${Date.now()}-${Math.random()}`, user: currentUser, content: tag, timestamp: new Date().toISOString(), ...(type === "user" ? { target_user: String(id) } : { group_id: id, group_name: activeChat.name }) };
+          setMessages(prev => { const next = [...prev, optimisticMsg]; setMessagesCache(cache => ({ ...cache, [String(id)]: next })); return next; });
+          setTimeout(scrollBottom, 50);
+          wsRef.current?.send(JSON.stringify({ type: type === "user" ? "direct_message" : "group_message", content: tag, message_type: "audio", ...(type === "user" ? { target_user: id } : { group_id: id }) }));
+        } catch {
+          showToast("Voice recording upload failed", "error");
+        }
       };
       mr.start(); setIsRecording(true);
-    } catch (err: any) { alert(`Microphone error: ${err?.message || err}`); setIsRecording(false); }
+    } catch (err: any) { showToast(`Microphone error: ${err?.message || err}`, "error"); setIsRecording(false); }
   };
 
   const rtcConfig = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:stun1.l.google.com:19302" }, { urls: "turn:a.relay.metered.ca:80", username: "e8dd65b92f3adf4536ee4310", credential: "6aBk4SYRGqDHpFKf" }, { urls: "turn:a.relay.metered.ca:80?transport=tcp", username: "e8dd65b92f3adf4536ee4310", credential: "6aBk4SYRGqDHpFKf" }, { urls: "turn:a.relay.metered.ca:443", username: "e8dd65b92f3adf4536ee4310", credential: "6aBk4SYRGqDHpFKf" }, { urls: "turns:a.relay.metered.ca:443?transport=tcp", username: "e8dd65b92f3adf4536ee4310", credential: "6aBk4SYRGqDHpFKf" }], iceCandidatePoolSize: 10 };
@@ -2416,7 +2820,7 @@ export default function FluxChat() {
           ...(groupId ? { group_id: groupId } : {})
         }));
       }
-    } catch (err: any) { alert(`Could not start call: ${err.message || err}`); endCall(false); }
+    } catch (err: any) { showToast(`Could not start call: ${err.message || err}`, "error"); endCall(false); }
   };
 
   const acceptCall = async () => {
@@ -2731,18 +3135,119 @@ export default function FluxChat() {
   const searchMessageResults = useMemo(() => {
     if (!searchQuery) return [];
     const results: (Message & { chatId: string | number; chatType: "user" | "group" })[] = [];
-    Object.entries(messagesCache.current).forEach(([chatId, msgs]) => { const isGroup = groups.some(g => String(g.id) === chatId); msgs.forEach(m => { if (!m._callRecord && m.content.toLowerCase().includes(searchQuery.toLowerCase()) && !m.content.startsWith("[")) results.push({ ...m, chatId, chatType: isGroup ? "group" : "user" }); }); });
+    Object.entries(messagesCache).forEach(([chatId, msgs]) => { const isGroup = groups.some(g => String(g.id) === chatId); msgs.forEach(m => { if (!m._callRecord && m.content.toLowerCase().includes(searchQuery.toLowerCase()) && !m.content.startsWith("[")) results.push({ ...m, chatId, chatType: isGroup ? "group" : "user" }); }); });
     return results;
-  }, [searchQuery, groups]);
+  }, [searchQuery, groups, messagesCache]);
 
   const formatDate = (ts: string) => { const d = parseTs(ts); const today = new Date(); if (d.toDateString() === today.toDateString()) return "Today"; const yesterday = new Date(today); yesterday.setDate(today.getDate() - 1); if (d.toDateString() === yesterday.toDateString()) return "Yesterday"; return d.toLocaleDateString([], { month: "short", day: "numeric" }); };
   const groupedMessages = useMemo(() => { const out: GroupedMessage[] = []; let lastDate: string | null = null; for (const msg of messages) { const label = formatDate(msg.timestamp); if (label !== lastDate) { out.push({ type: "divider", label }); lastDate = label; } out.push({ type: "msg", ...msg }); } return out; }, [messages]); // eslint-disable-line
+
+  const rowVirtualizer = useVirtualizer({
+    count: groupedMessages.length,
+    getScrollElement: () => msgListRef.current,
+    estimateSize: () => 60,
+    overscan: 10,
+    gap: 2,
+    getItemKey: useCallback((index: number) => {
+      const item = groupedMessages[index];
+      return item ? (item.type === "divider" ? `div-${item.label}-${index}` : item.id) : index;
+    }, [groupedMessages]),
+  });
 
   const handleAppClick = useCallback(() => { setSidebarDeleteId(null); setReactionPickerId(null); setSelectedMsgId(null); }, []);
   const checkUsernameAvailability = useDebounceCallback(async (value: string) => { if (value.length >= 3) { try { const res = await apiFetch<{ available: boolean }>(`/auth/check-username/${value}`); if (!res.available) dispatchAuth({ type: "SET_ERROR", value: "Username already taken" }); } catch { } } }, 500);
 
   const emojis = ["😀", "😃", "😄", "😁", "😆", "😅", "🤣", "😂", "🙂", "😊", "😇", "🥰", "😍", "🤩", "😘", "😗", "😚", "😙", "🥲", "😋", "😛", "😜", "🤪", "😝", "🤑", "🤗", "🤭", "🫢", "🤫", "🤔", "🫡", "🤐", "🤨", "😐", "😑", "😶", "😏", "😒", "🙄", "😬", "🤥", "😌", "😔", "😪", "🤤", "😴", "😷", "🤒", "🤕", "🤢", "🤮", "🥵", "🥶", "🥴", "😵", "🤯", "🤠", "🥳", "😎", "🤓", "🧐", "😕", "😟", "🙁", "☹️", "😮", "😯", "😲", "😳", "🥺", "😦", "😧", "😨", "😰", "😥", "😢", "😭", "😱", "😖", "😣", "😞", "😓", "😩", "😫", "🥱", "😤", "😡", "😠", "🤬", "💀", "👻", "😈", "👿", "💩", "🤡", "👹", "👍", "👎", "👌", "✌️", "🤞", "🫰", "🤟", "🤘", "🤙", "👈", "👉", "👆", "👇", "☝️", "✋", "🤚", "🖐️", "👋", "🤏", "👏", "🙌", "🫶", "🤲", "🙏", "✍️", "💪", "❤️", "🧡", "💛", "💚", "💙", "💜", "🔥", "💫", "⭐", "🌟", "✨", "💥", "❄️", "🌈", "☀️", "🌙", "🎉", "🎊", "🎈", "🎁", "🏆", "🥇", "🎵", "🎶", "🎤", "🎸", "🎹", "🚀", "✈️", "🌍", "🌊", "🌺", "🌸", "🍕", "🍔", "☕", "✅", "❌", "⚡", "💯", "💬", "📌", "🔗", "🔑", "💡", "🔔", "📢", "👀", "💤", "🆗", "🆙", "🔝"];
   const reactionEmojis = ["👍", "❤️", "😂", "😮", "😢", "🙏", "🔥", "💯"];
+
+  const emojiRows = useMemo(() => {
+    const COLUMNS = 10;
+    const rows = [];
+    for (let i = 0; i < emojis.length; i += COLUMNS) {
+      rows.push(emojis.slice(i, i + COLUMNS));
+    }
+    return rows;
+  }, [emojis]);
+
+  useEffect(() => {
+    if (showEmojis && emojiActiveCellRef.current) {
+      emojiActiveCellRef.current.focus();
+    }
+  }, [focusedEmojiCoord, showEmojis]);
+
+  const prevShowEmojis = useRef(showEmojis);
+  useEffect(() => {
+    if (showEmojis) {
+      setFocusedEmojiCoord({ r: 0, c: 0 });
+    } else if (prevShowEmojis.current && !showEmojis) {
+      emojiToggleRef.current?.focus();
+    }
+    prevShowEmojis.current = showEmojis;
+  }, [showEmojis]);
+
+  const handleEmojiKeyDown = (e: React.KeyboardEvent<HTMLButtonElement>, r: number, c: number) => {
+    const rowCount = emojiRows.length;
+    const colCount = emojiRows[r].length;
+
+    let nextR = r;
+    let nextC = c;
+    let handled = false;
+
+    switch (e.key) {
+      case "ArrowRight":
+        if (c < colCount - 1) {
+          nextC = c + 1;
+        } else if (r < rowCount - 1) {
+          nextR = r + 1;
+          nextC = 0;
+        }
+        handled = true;
+        break;
+      case "ArrowLeft":
+        if (c > 0) {
+          nextC = c - 1;
+        } else if (r > 0) {
+          nextR = r - 1;
+          nextC = emojiRows[r - 1].length - 1;
+        }
+        handled = true;
+        break;
+      case "ArrowDown":
+        if (r < rowCount - 1) {
+          nextR = r + 1;
+          nextC = Math.min(c, emojiRows[r + 1].length - 1);
+        }
+        handled = true;
+        break;
+      case "ArrowUp":
+        if (r > 0) {
+          nextR = r - 1;
+          nextC = Math.min(c, emojiRows[r - 1].length - 1);
+        }
+        handled = true;
+        break;
+      case "Home":
+        nextC = 0;
+        handled = true;
+        break;
+      case "End":
+        nextC = colCount - 1;
+        handled = true;
+        break;
+      case "Escape":
+        setShowEmojis(false);
+        handled = true;
+        break;
+      default:
+        break;
+    }
+
+    if (handled) {
+      e.preventDefault();
+      e.stopPropagation();
+      setFocusedEmojiCoord({ r: nextR, c: nextC });
+    }
+  };
   const callDisplayName = callPeerName || (callPeer ? getPeerName(callPeer) : "") || (callPeer ? callPeer.split("@")[0] : "");
 
   if (!isMounted) return (<div className="app loading-screen"><div className="spinner loading-spinner-circle"></div></div>);
@@ -2754,11 +3259,14 @@ export default function FluxChat() {
         <ContactProfile
           contact={contacts.find(c => c.email === activeChat.id)}
           activeChat={activeChat} currentUser={currentUser} nicknames={nicknames}
-          contactLabel={contactLabel} callLogs={callLogs} messagesCache={messagesCache.current}
+          contactLabel={contactLabel} callLogs={callLogs} messagesCache={messagesCache}
           onClose={() => setShowContactProfile(false)}
           onCall={(video) => { setShowContactProfile(false); startCall(video); }}
           onNicknameEdit={() => { setShowContactProfile(false); openHeaderNicknameEdit(); }}
           getPeerName={getPeerName} onViewFile={(url, type) => setViewFile({ url, type })}
+          isBlocked={blockedUsers.has(String(activeChat.id))}
+          onBlock={() => blockUser(String(activeChat.id))}
+          onUnblock={() => unblockUser(String(activeChat.id))}
         />
       )}
 
@@ -2766,7 +3274,7 @@ export default function FluxChat() {
         <GroupProfile
           group={groups.find(g => g.id === activeChat.id)} activeChat={activeChat}
           currentUser={currentUser} contacts={contacts} contactLabel={contactLabel}
-          callLogs={callLogs} messagesCache={messagesCache.current}
+          callLogs={callLogs} messagesCache={messagesCache}
           newGroupMemberSearchInput={newGroupMemberSearchInput} setNewGroupMemberSearchInput={setNewGroupMemberSearchInput}
           isUploadingGroupAvatar={isUploadingGroupAvatar} groupAvatarInputRef={groupAvatarInputRef}
           handleGroupAvatarUpload={handleGroupAvatarUpload}
@@ -2785,8 +3293,8 @@ export default function FluxChat() {
 
           <div className="auth-left">
             <div className="brand">
-              <div className="brand-icon">
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2" /></svg>
+              <div className="brand-icon" style={{ overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                <img src="/icon.png" alt="Flux" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
               </div>
               <span>Flux</span>
             </div>
@@ -2954,14 +3462,34 @@ export default function FluxChat() {
       ) : (
         /* ══ MAIN APP SHELL ══════════════════════════════════════════════════ */
         <div className={`shell ${activeChat ? "chat-active" : ""}`}>
+          {wsStatus === "offline" && (
+            <div className="offline-banner">
+              <div className="offline-banner-content">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ marginRight: 8 }}>
+                  <path d="M1 1l22 22M16.72 11.06A10.94 10.94 0 0119 12.5M5 12.5a10.94 10.94 0 015.83-2.84M8.53 16.03a6 6 0 013.47-1.53M12 20h.01M16.24 7.76a16.14 16.14 0 012.01 1.24" />
+                </svg>
+                You are currently offline. Check your connection.
+              </div>
+              <button className="offline-retry-btn" onClick={() => {
+                wsRetryDelay.current = 800;
+                wsRetryCount.current = 0;
+                setWsStatus("reconnecting");
+                initWSRef.current?.();
+              }}>
+                Retry Connection
+              </button>
+            </div>
+          )}
 
           {/* ── SIDEBAR ── */}
           <aside className="sidebar">
             <div className="sb-brand-header">
               <div className="sb-brand-left">
-                <div className="sb-brand-icon-wrap"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2" /></svg></div>
+                <div className="sb-brand-icon-wrap" style={{ overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                  <img src="/icon.png" alt="Flux" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                </div>
                 <span className="sb-brand-name">Flux</span>
-                <span className="sb-ws-dot" style={{ background: wsStatus === "connected" ? "#4ade80" : wsStatus === "reconnecting" ? "#fbbf24" : "#333" }} title={wsStatus} />
+                <span className="sb-ws-dot" style={{ background: wsStatus === "connected" ? "#4ade80" : wsStatus === "reconnecting" ? "#fbbf24" : wsStatus === "offline" ? "#ef4444" : "#333" }} title={wsStatus} />
                 {totalUnread > 0 && <span onClick={e => { e.stopPropagation(); markAllRead(); }} title="Mark all read" className="sb-total-unread">{totalUnread > 99 ? "99+" : totalUnread}</span>}
               </div>
               <div className="sb-brand-actions">
@@ -2980,7 +3508,7 @@ export default function FluxChat() {
               </div>
               <div className="sb-id-info">
                 <span className="sb-id-name">{profile.displayName || profile.username || "Me"}</span>
-                <span className="sb-id-status">@{profile.username}{wsStatus === "reconnecting" && <span style={{ color: "#fbbf24", fontSize: 9 }}> · Reconnecting…</span>}</span>
+                <span className="sb-id-status">@{profile.username}{wsStatus === "reconnecting" && <span style={{ color: "#fbbf24", fontSize: 9 }}> · Reconnecting…</span>}{wsStatus === "offline" && <span style={{ color: "#ef4444", fontSize: 9 }}> · Connection lost</span>}</span>
               </div>
             </div>
 
@@ -3050,6 +3578,36 @@ export default function FluxChat() {
                   </div>
                 </div>
 
+                {/* ── Privacy Section ── */}
+                <div className="settings-section">
+                  <div className="settings-section-label">Privacy</div>
+                  <div className="settings-card">
+                    <button className="settings-action-row" onClick={() => setShowBlockedList(!showBlockedList)}>
+                      <span className="settings-action-row__icon" style={{ color: "var(--danger)", background: "var(--danger-dim)" }}>
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2" /><path d="M7 11V7a5 5 0 0110 0v4" /></svg>
+                      </span>
+                      <span style={{ flex: 1, color: blockedUsers.size > 0 ? "var(--danger)" : "inherit" }}>Blocked Users</span>
+                      <span className="blocked-count-badge" style={{ background: blockedUsers.size > 0 ? "var(--danger-dim)" : "rgba(255,255,255,0.08)", color: blockedUsers.size > 0 ? "var(--danger)" : "inherit", padding: "2px 6px", borderRadius: 10, fontSize: 11, marginRight: 6, border: blockedUsers.size > 0 ? "1px solid var(--danger-border)" : "none" }}>{blockedUsers.size}</span>
+                      <svg className={`chevron ${showBlockedList ? "chevron--up" : ""}`} width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="6,9 12,15 18,9" /></svg>
+                    </button>
+
+                    {showBlockedList && (
+                      <div style={{ padding: "10px 12px 14px", borderTop: "1px solid var(--border)", display: "flex", flexDirection: "column", gap: 8 }}>
+                        {blockedUsers.size === 0 ? (
+                          <p className="text-muted-sm" style={{ margin: 0, textAlign: "center", color: "var(--danger)" }}>No blocked users</p>
+                        ) : (
+                          Array.from(blockedUsers).map(email => (
+                            <div key={email} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+                              <span style={{ fontSize: 13, textOverflow: "ellipsis", overflow: "hidden", whiteSpace: "nowrap", flex: 1, color: "var(--danger)" }}>{email}</span>
+                              <button onClick={() => unblockUser(email)} style={{ background: "none", border: "none", color: "var(--green)", fontSize: 12, cursor: "pointer", fontWeight: "bold", padding: "4px 8px" }}>Unblock</button>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
                 <div style={{ height: 6 }} />
               </div>
             )}
@@ -3060,129 +3618,190 @@ export default function FluxChat() {
               <div className="sb-search-wrap">
                 <svg className="sb-search-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" /></svg>
                 <input type="text" value={searchQuery} onChange={e => setSearchQuery(e.target.value)} placeholder="Search conversations…" className="sb-search-input" />
-                {searchQuery && <button onClick={() => setSearchQuery("")} className="sb-search-clear">✕</button>}
+                {searchQuery && <button onClick={() => setSearchQuery("")} className="sb-search-clear" aria-label="Clear search">✕</button>}
               </div>
               {totalUnread > 0 && <button onClick={e => { e.stopPropagation(); markAllRead(); }} className="sb-mark-read-btn">✓ All</button>}
             </div>
 
-            {searchQuery && searchMessageResults.length > 0 && (
-              <div className="sb-section search-results-section">
-                <div className="sb-section-hdr"><div className="sb-section-label-group"><span className="sb-section-label-text">Messages</span></div></div>
-                <div className="sb-list">
-                  {searchMessageResults.map(m => {
-                    const groupName = groups.find(g => String(g.id) === String(m.chatId))?.name;
-                    const c = contacts.find(c => c.email === String(m.chatId));
-                    const chatName = m.chatType === "group" ? groupName : (c ? contactLabel(c) : "Unknown User");
-                    return (
-                      <button key={`${m.chatId}-${m.id}`} className="sb-item" onClick={() => openChat({ type: m.chatType, id: String(m.chatId), name: String(chatName || "Chat") })}>
-                        <div className="sb-item-body mw-0"><span className="sb-item-name name-row">{String(chatName || "Chat")}</span><span className="sb-item-status text-truncate">{m.content}</span></div>
-                      </button>
-                    );
-                  })}
+            {searchQuery.trim() !== "" && sortedContacts.length === 0 && sortedGroups.length === 0 && searchMessageResults.length === 0 ? (
+              <div className="sb-empty-state">
+                <div className="sb-empty-state-icon">
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                    <circle cx="11" cy="11" r="8" />
+                    <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                  </svg>
                 </div>
-                <div className="sb-divider"></div>
+                <div className="sb-empty-state-title">No results found</div>
+                <p className="sb-empty-state-text">
+                  No contacts, groups, or messages match &ldquo;{searchQuery}&rdquo;
+                </p>
               </div>
-            )}
-
-            <div className="sb-section">
-              <div className="sb-section-hdr">
-                <div className="sb-section-label-group">
-                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" /></svg>
-                  <span className="sb-section-label-text">Messages</span>
-                  <button onClick={() => setShowNewContact(!showNewContact)} className={`sb-add-btn-inline ${showNewContact ? "active" : ""}`} title="New chat">
-                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>
-                  </button>
-                </div>
-              </div>
-              {showNewContact && (
-                <div className="sb-add-form drop">
-                  <div style={{ position: "relative" }}><span style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", color: "var(--text-3)", fontWeight: 700, fontSize: 13 }}>@</span><input value={newContactUsername} onChange={e => setNewContactUsername(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, ""))} onKeyDown={e => { if (e.key === "Enter") { addContactByUsername(newContactUsername); setNewContactUsername(""); setShowNewContact(false); } }} placeholder="username" className="sb-field" style={{ paddingLeft: 22 }} autoFocus /></div>
-                  <p className="text-muted-sm">Search by @username</p>
-                  <button onClick={() => { addContactByUsername(newContactUsername); setNewContactUsername(""); setShowNewContact(false); }} className="sb-go-btn">Start chat</button>
-                </div>
-              )}
-              <div className="sb-list">
-                {sortedContacts.map(c => (
-                  <ContactItem key={c.email} contact={c} isActive={activeChat?.id === c.email} isDeleteTarget={sidebarDeleteId === c.email} unreadCount={unread[c.email] || 0} lastPreview={lastPreview[c.email] || ""} label={contactLabel(c)} nickname={nicknames[c.email]} lastActivityTs={lastActivity[c.email] || 0} onOpen={() => openChat({ type: "user", id: c.email, name: contactLabel(c) })} onDelete={() => deleteChat("user", c.email)} onDeleteTarget={setSidebarDeleteId} onClearDelete={() => setSidebarDeleteId(null)} />
-                ))}
-              </div>
-            </div>
-
-            <div className="sb-divider"></div>
-
-            <div className="sb-section">
-              <div className="sb-section-hdr">
-                <div className="sb-section-label-group">
-                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2" /><circle cx="9" cy="7" r="4" /><path d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75" /></svg>
-                  <span className="sb-section-label-text">Groups</span>
-                  <button onClick={() => setShowNewGroup(!showNewGroup)} className={`sb-add-btn-inline ${showNewGroup ? "active" : ""}`} title="New group">
-                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>
-                  </button>
-                </div>
-              </div>
-              {showNewGroup && (
-                <div className="sb-add-form drop">
-                  <input value={newGroupName} onChange={e => setNewGroupName(e.target.value)} placeholder="Group name *" className="sb-field" />
-                  <input value={newGroupDesc} onChange={e => setNewGroupDesc(e.target.value)} placeholder="Description (optional)" className="sb-field" />
-                  {/* Username chip picker */}
-                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6, padding: "6px 8px", background: "var(--surface-2)", borderRadius: 8, minHeight: 38, alignItems: "center" }}>
-                    {newGroupMemberChips.map(chip => (
-                      <span key={chip} style={{ display: "flex", alignItems: "center", gap: 4, background: "var(--primary)", color: "#fff", borderRadius: 20, padding: "2px 10px", fontSize: 12 }}>
-                        @{chip}
-                        <button onClick={() => setNewGroupMemberChips(prev => prev.filter(c => c !== chip))} style={{ background: "none", border: "none", color: "#fff", cursor: "pointer", fontSize: 14, lineHeight: 1, padding: 0 }}>×</button>
-                      </span>
-                    ))}
-                    <input
-                      value={newGroupMemberInput}
-                      onChange={e => setNewGroupMemberInput(e.target.value)}
-                      onKeyDown={e => {
-                        if ((e.key === "Enter" || e.key === " ") && newGroupMemberInput.trim()) {
-                          e.preventDefault();
-                          const uname = newGroupMemberInput.trim().replace(/^@/, "");
-                          if (uname && !newGroupMemberChips.includes(uname)) setNewGroupMemberChips(prev => [...prev, uname]);
-                          setNewGroupMemberInput("");
-                        }
-                      }}
-                      placeholder={newGroupMemberChips.length === 0 ? "Add @username & press Enter" : "Add more…"}
-                      style={{ border: "none", outline: "none", background: "transparent", flex: 1, minWidth: 120, fontSize: 13, color: "var(--text-1)", padding: "2px 4px" }}
-                    />
+            ) : (
+              <>
+                {searchQuery && searchMessageResults.length > 0 && (
+                  <div className="sb-section search-results-section">
+                    <div className="sb-section-hdr"><div className="sb-section-label-group"><span className="sb-section-label-text">Messages</span></div></div>
+                    <div className="sb-list">
+                      {searchMessageResults.map(m => {
+                        const groupName = groups.find(g => String(g.id) === String(m.chatId))?.name;
+                        const c = contacts.find(c => c.email === String(m.chatId));
+                        const chatName = m.chatType === "group" ? groupName : (c ? contactLabel(c) : "Unknown User");
+                        return (
+                          <button key={`${m.chatId}-${m.id}`} className="sb-item" onClick={() => openChat({ type: m.chatType, id: String(m.chatId), name: String(chatName || "Chat") })}>
+                            <div className="sb-item-body mw-0"><span className="sb-item-name name-row">{String(chatName || "Chat")}</span><span className="sb-item-status text-truncate">{m.content}</span></div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <div className="sb-divider"></div>
                   </div>
-                  <button onClick={async () => {
-                    const allChips = newGroupMemberInput.trim()
-                      ? [...newGroupMemberChips, newGroupMemberInput.trim().replace(/^@/, "")]
-                      : newGroupMemberChips;
-                    if (!newGroupName.trim()) return;
-                    // Resolve usernames to emails
-                    const memberEmails: string[] = [];
-                    for (const uname of allChips) {
-                      if (uname.includes("@")) { memberEmails.push(uname); continue; }
-                      try {
-                        const prof = await apiFetch<{ email: string }>(`/profile/by-username/${encodeURIComponent(uname)}`);
-                        memberEmails.push(prof.email);
-                      } catch { memberEmails.push(uname); }
-                    }
-                    try {
-                      await apiFetch("/groups", { method: "POST", body: JSON.stringify({ name: newGroupName.trim(), description: newGroupDesc, members: memberEmails }) });
-                      setNewGroupName(""); setNewGroupDesc(""); setNewGroupMemberChips([]); setNewGroupMemberInput(""); setShowNewGroup(false); loadGroups();
-                    } catch (err) { alert("Failed to create group: " + errorMessage(err)); }
-                  }} className="sb-go-btn secondary">Create group</button>
+                )}
+
+                <div className="sb-section">
+                  <div className="sb-section-hdr">
+                    <div className="sb-section-label-group">
+                      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" /></svg>
+                      <span className="sb-section-label-text">Messages</span>
+                      <button onClick={() => setShowNewContact(!showNewContact)} className={`sb-add-btn-inline ${showNewContact ? "active" : ""}`} title="New chat" aria-label="New chat">
+                        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>
+                      </button>
+                    </div>
+                  </div>
+                  {showNewContact && (
+                    <div className="sb-add-form drop">
+                      <div style={{ position: "relative" }}><span style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", color: "var(--text-3)", fontWeight: 700, fontSize: 13 }}>@</span><input value={newContactUsername} onChange={e => setNewContactUsername(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, ""))} onKeyDown={e => { if (e.key === "Enter") { addContactByUsername(newContactUsername); setNewContactUsername(""); setShowNewContact(false); } }} placeholder="username" className="sb-field" style={{ paddingLeft: 22 }} autoFocus /></div>
+                      <p className="text-muted-sm">Search by @username</p>
+                      <button onClick={() => { addContactByUsername(newContactUsername); setNewContactUsername(""); setShowNewContact(false); }} className="sb-go-btn">Start chat</button>
+                    </div>
+                  )}
+                  <div className="sb-list">
+                    {sortedContacts.map(c => (
+                      <ContactItem key={c.email} contact={c} isActive={activeChat?.id === c.email} isDeleteTarget={sidebarDeleteId === c.email} unreadCount={unread[c.email] || 0} lastPreview={lastPreview[c.email] || ""} label={contactLabel(c)} nickname={nicknames[c.email]} lastActivityTs={lastActivity[c.email] || 0} onOpen={() => openChat({ type: "user", id: c.email, name: contactLabel(c) })} onDelete={() => deleteChat("user", c.email)} onDeleteTarget={setSidebarDeleteId} onClearDelete={() => setSidebarDeleteId(null)} />
+                    ))}
+                  </div>
                 </div>
-              )}
-              <div className="sb-list">
-                {sortedGroups.map(g => (
-                  <GroupItem key={g.id} group={g} isActive={activeChat?.id === g.id} isDeleteTarget={sidebarDeleteId === String(g.id)} unreadCount={unread[String(g.id)] || 0} lastPreview={lastPreview[String(g.id)] || ""} lastActivityTs={lastActivity[String(g.id)] || 0} onOpen={() => openChat({ type: "group", id: g.id, name: g.name })} onDelete={() => deleteChat("group", g.id)} onDeleteTarget={setSidebarDeleteId} onClearDelete={() => setSidebarDeleteId(null)} />
-                ))}
-              </div>
-            </div>
+
+                <div className="sb-divider"></div>
+
+                <div className="sb-section">
+                  <div className="sb-section-hdr">
+                    <div className="sb-section-label-group">
+                      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2" /><circle cx="9" cy="7" r="4" /><path d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75" /></svg>
+                      <span className="sb-section-label-text">Groups</span>
+                      <button onClick={() => setShowNewGroup(!showNewGroup)} className={`sb-add-btn-inline ${showNewGroup ? "active" : ""}`} title="New group" aria-label="New group">
+                        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>
+                      </button>
+                    </div>
+                  </div>
+                  {showNewGroup && (
+                    <div className="sb-add-form drop">
+                      <input value={newGroupName} onChange={e => setNewGroupName(e.target.value)} placeholder="Group name *" className="sb-field" />
+                      <input value={newGroupDesc} onChange={e => setNewGroupDesc(e.target.value)} placeholder="Description (optional)" className="sb-field" />
+                      {/* Username chip picker */}
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, padding: "6px 8px", background: "var(--surface-2)", borderRadius: 8, minHeight: 38, alignItems: "center" }}>
+                        {newGroupMemberChips.map(chip => (
+                          <span key={chip} style={{ display: "flex", alignItems: "center", gap: 4, background: "var(--primary)", color: "#fff", borderRadius: 20, padding: "2px 10px", fontSize: 12 }}>
+                            @{chip}
+                            <button onClick={() => setNewGroupMemberChips(prev => prev.filter(c => c !== chip))} style={{ background: "none", border: "none", color: "#fff", cursor: "pointer", fontSize: 14, lineHeight: 1, padding: 0 }} aria-label="Remove member">×</button>
+                          </span>
+                        ))}
+                        <input
+                          value={newGroupMemberInput}
+                          onChange={e => setNewGroupMemberInput(e.target.value)}
+                          onKeyDown={e => {
+                            if ((e.key === "Enter" || e.key === " ") && newGroupMemberInput.trim()) {
+                              e.preventDefault();
+                              const uname = newGroupMemberInput.trim().replace(/^@/, "");
+                              if (uname && !newGroupMemberChips.includes(uname)) setNewGroupMemberChips(prev => [...prev, uname]);
+                              setNewGroupMemberInput("");
+                            }
+                          }}
+                          placeholder={newGroupMemberChips.length === 0 ? "Add @username & press Enter" : "Add more…"}
+                          style={{ border: "none", outline: "none", background: "transparent", flex: 1, minWidth: 120, fontSize: 13, color: "var(--text-1)", padding: "2px 4px" }}
+                        />
+                      </div>
+                      <button onClick={async () => {
+                        const allChips = newGroupMemberInput.trim()
+                          ? [...newGroupMemberChips, newGroupMemberInput.trim().replace(/^@/, "")]
+                          : newGroupMemberChips;
+                        if (!newGroupName.trim()) return;
+                        // Resolve usernames to emails
+                        const memberEmails: string[] = [];
+                        const failedLookups: string[] = [];
+                        for (const uname of allChips) {
+                          if (uname.includes("@")) { memberEmails.push(uname); continue; }
+                          try {
+                            const prof = await apiFetch<{ email: string }>(`/profile/by-username/${encodeURIComponent(uname)}`);
+                            memberEmails.push(prof.email);
+                          } catch {
+                            failedLookups.push(uname);
+                          }
+                        }
+                        if (failedLookups.length > 0) {
+                          showToast("Usernames not found: " + failedLookups.map(u => "@" + u).join(", "), "error");
+                          return;
+                        }
+                        try {
+                          const group = await apiFetch<any>("/groups", { method: "POST", body: JSON.stringify({ name: newGroupName.trim(), description: newGroupDesc, members: memberEmails }) });
+                          
+                          // Distribute a new group key to all members
+                          try {
+                            const { keyId, groupKey } = await generateGroupKey();
+                            const privKey = e2ePrivKeyRef.current;
+                            const myPubB64 = e2ePubKeyB64Ref.current;
+
+                            if (privKey && myPubB64) {
+                              const memberKeyEntries: { email: string; encrypted_key: string }[] = [];
+
+                              for (const memberEmail of [...memberEmails, currentUser]) {
+                                const theirPub = memberEmail === currentUser
+                                  ? myPubB64
+                                  : await getPeerPubKey(memberEmail);
+
+                                if (theirPub) {
+                                  const encKey = await wrapGroupKeyForMember({ keyId, groupKey }, privKey, theirPub);
+                                  memberKeyEntries.push({ email: memberEmail, encrypted_key: encKey });
+                                }
+                              }
+
+                              if (memberKeyEntries.length > 0) {
+                                await apiFetch(`/groups/${group.id}/e2e-key`, {
+                                  method: "POST",
+                                  body: JSON.stringify({
+                                    key_id:         keyId,
+                                    setter_pub_key: myPubB64,
+                                    member_keys:    memberKeyEntries,
+                                  }),
+                                });
+                                groupKeyCache.set(String(group.id), groupKey);
+                              }
+                            }
+                          } catch (err) {
+                            console.warn("[E2E] Group key distribution failed:", err);
+                          }
+
+                          setNewGroupName(""); setNewGroupDesc(""); setNewGroupMemberChips([]); setNewGroupMemberInput(""); setShowNewGroup(false); loadGroups();
+                        } catch (err) { showToast("Failed to create group: " + errorMessage(err), "error"); }
+                      }} className="sb-go-btn secondary">Create group</button>
+                    </div>
+                  )}
+                  <div className="sb-list">
+                    {sortedGroups.map(g => (
+                      <GroupItem key={g.id} group={g} isActive={activeChat?.id === g.id} isDeleteTarget={sidebarDeleteId === String(g.id)} unreadCount={unread[String(g.id)] || 0} lastPreview={lastPreview[String(g.id)] || ""} lastActivityTs={lastActivity[String(g.id)] || 0} onOpen={() => openChat({ type: "group", id: g.id, name: g.name })} onDelete={() => deleteChat("group", g.id)} onDeleteTarget={setSidebarDeleteId} onClearDelete={() => setSidebarDeleteId(null)} />
+                    ))}
+                  </div>
+                </div>
+              </>
+            )}
           </aside>
 
           {/* ── CHAT MAIN ── */}
           <main className="chat">
             {!activeChat ? (
               <div className="empty-state">
-                <div className="empty-rings">
+                <div className="empty-rings" style={{ position: "relative", display: "flex", alignItems: "center", justifyContent: "center" }}>
                   <div className="ring r1"></div><div className="ring r2"></div><div className="ring r3"></div>
-                  <svg className="z-1-relative" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2" /></svg>
+                  <img className="z-1-relative" src="/icon.png" alt="Flux" style={{ width: 48, height: 48, objectFit: "cover", borderRadius: 12, boxShadow: "0 8px 24px rgba(0, 0, 0, 0.4)" }} />
                 </div>
                 <h3>No conversation open</h3>
                 <p>Select a contact or group to start messaging</p>
@@ -3191,7 +3810,7 @@ export default function FluxChat() {
               <>
                 <header className="chat-hdr">
                   <div className="chat-hdr-left">
-                    <button className="mobile-back-btn" onClick={() => setActiveChat(null)}>
+                    <button className="mobile-back-btn" onClick={() => setActiveChat(null)} aria-label="Back to chat list">
                       <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M15 18l-6-6 6-6" /></svg>
                     </button>
                     <div
@@ -3211,7 +3830,7 @@ export default function FluxChat() {
                           {activeChat.type === "user" ? (() => { const c = contacts.find(c => c.email === activeChat.id); return c ? contactLabel(c) : activeChat.name; })() : activeChat.name}
                         </span>
                         {activeChat.type === "user" && (
-                          <button onClick={openHeaderNicknameEdit} className={`btn-pencil-nickname ${showHeaderNicknameEdit ? "active" : ""}`}>
+                          <button onClick={openHeaderNicknameEdit} className={`btn-pencil-nickname ${showHeaderNicknameEdit ? "active" : ""}`} aria-label="Edit nickname">
                             <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7" /><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" /></svg>
                           </button>
                         )}
@@ -3225,13 +3844,13 @@ export default function FluxChat() {
                     </div>
                   </div>
                   <div className="hdr-right">
-                    <button onClick={() => startCall(false)} className="tool-btn" title="Voice Call">
+                    <button onClick={() => startCall(false)} className="tool-btn" title="Voice Call" aria-label="Start voice call">
                       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07A19.5 19.5 0 014.69 12a19.79 19.79 0 01-3.07-8.67A2 2 0 013.6 1.37h3a2 2 0 012 1.72c.127.96.361 1.903.7 2.81a2 2 0 01-.45 2.11L7.91 9a16 16 0 006.09 6.09l1.97-1.85a2 2 0 012.11-.45c.907.339 1.85.573 2.81.7a2 2 0 011.72 2.03z" /></svg>
                     </button>
-                    <button onClick={() => startCall(true)} className="tool-btn" title="Video Call">
+                    <button onClick={() => startCall(true)} className="tool-btn" title="Video Call" aria-label="Start video call">
                       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polygon points="23 7 16 12 23 17 23 7" /><rect x="1" y="5" width="15" height="14" rx="2" /></svg>
                     </button>
-                    <button className="tool-btn" title="Delete chat" onClick={() => { if (window.confirm("Delete this chat? Only you will lose it.")) deleteChat(activeChat.type, activeChat.id); }}>
+                    <button className="tool-btn" title="Delete chat" aria-label="Delete chat" onClick={() => { if (window.confirm("Delete this chat? Only you will lose it.")) deleteChat(activeChat.type, activeChat.id); }}>
                       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6" /><path d="M10 11v6M14 11v6" /><path d="M9 6V4h6v2" /></svg>
                     </button>
                   </div>
@@ -3247,41 +3866,84 @@ export default function FluxChat() {
                     <div className="nickname-edit-actions">
                       <button onClick={() => saveContactNickname(String(activeChat.id), headerNicknameValue)} className="sb-go-btn btn-save-sm">Save</button>
                       {nicknames[String(activeChat.id)] && <button onClick={() => saveContactNickname(String(activeChat.id), "")} className="sb-go-btn btn-clear-sm">Clear</button>}
-                      <button onClick={() => setShowHeaderNicknameEdit(false)} className="sb-go-btn btn-close-sm">✕</button>
+                      <button onClick={() => setShowHeaderNicknameEdit(false)} className="sb-go-btn btn-close-sm" aria-label="Close nickname editor">✕</button>
                     </div>
                   </div>
                 )}
 
-                <div ref={msgListRef} className="msg-list" onClick={handleAppClick}>
-                  <div ref={loadMoreSentinelRef} style={{ height: 1, marginBottom: 0 }}>
-                    {loadingMore && (
-                      <div className="load-more-row">
-                        <span className="spinner" style={{ width: 14, height: 14 }} />
-                        <span style={{ fontSize: 12, color: "var(--text-3)", marginLeft: 6 }}>Loading older messages…</span>
-                      </div>
-                    )}
-                  </div>
+                <div ref={msgListRef} className="msg-list" onClick={handleAppClick} style={{ position: "relative" }}>
+                  <div ref={loadMoreSentinelRef} style={{ height: 1, position: "absolute", top: 0, left: 0, right: 0 }} />
+                  {loadingMore && (
+                    <div className="load-more-row" style={{ position: "absolute", top: 10, left: "50%", transform: "translateX(-50%)", zIndex: 10, background: "var(--surface-2)", border: "1px solid var(--border)", padding: "6px 16px", borderRadius: "100px", boxShadow: "0 4px 12px rgba(0,0,0,0.15)" }}>
+                      <span className="spinner" style={{ width: 14, height: 14 }} />
+                      <span style={{ fontSize: 12, color: "var(--text-2)", marginLeft: 6 }}>Loading older messages…</span>
+                    </div>
+                  )}
 
-                  {groupedMessages.map((item, idx) =>
-                    item.type === "divider" ? (
-                      <div key={`div-${item.label}-${idx}`} className="date-sep"><span>{item.label}</span></div>
-                    ) : (
-                      <MessageBubble
-                        key={item.id} item={item} currentUser={currentUser}
-                        isSelected={selectedMsgId === item.id} isEditing={editingId === item.id}
-                        editingText={editingText} reactionPickerId={reactionPickerId}
-                        chatType={activeChat.type} reactionEmojis={reactionEmojis}
-                        contacts={contacts} getPeerName={getPeerName} contactLabel={contactLabel}
-                        isFailed={failedMsgIds.has(String(item.id))}
-                        onReply={msg => { setReplyingTo(msg); setReactionPickerId(null); setSelectedMsgId(null); }}
-                        onEditStart={(id, text) => { setEditingId(id); setEditingText(text); setReactionPickerId(null); setSelectedMsgId(null); }}
-                        onEditSave={saveEdit} onEditCancel={() => setEditingId(null)} onEditChange={setEditingText}
-                        onDelete={id => { deleteMsg(id); setSelectedMsgId(null); }}
-                        onReaction={sendReaction} onSetReactionPicker={setReactionPickerId}
-                        onViewFile={(url, type) => setViewFile({ url, type })} onSelectMsg={setSelectedMsgId}
-                        onRetry={retryMessage}
-                      />
-                    )
+                  {isLoadingHistory ? (
+                    <div className="skeleton-container">
+                      <div className="skeleton-bubble theirs">
+                        <div className="skeleton-line short"></div>
+                        <div className="skeleton-line long"></div>
+                      </div>
+                      <div className="skeleton-bubble mine">
+                        <div className="skeleton-line medium"></div>
+                      </div>
+                      <div className="skeleton-bubble theirs">
+                        <div className="skeleton-line long"></div>
+                        <div className="skeleton-line short"></div>
+                      </div>
+                      <div className="skeleton-bubble mine">
+                        <div className="skeleton-line long"></div>
+                      </div>
+                    </div>
+                  ) : (
+                    <div
+                      style={{
+                        height: `${rowVirtualizer.getTotalSize()}px`,
+                        width: "100%",
+                        position: "relative",
+                      }}
+                    >
+                      {rowVirtualizer.getVirtualItems().map((virtualRow) => {
+                        const item = groupedMessages[virtualRow.index];
+                        if (!item) return null;
+                        return (
+                          <div
+                            key={virtualRow.key}
+                            ref={rowVirtualizer.measureElement}
+                            data-index={virtualRow.index}
+                            style={{
+                              position: "absolute",
+                              top: 0,
+                              left: 0,
+                              width: "100%",
+                              transform: `translateY(${virtualRow.start}px)`,
+                            }}
+                          >
+                            {item.type === "divider" ? (
+                              <div className="date-sep"><span>{item.label}</span></div>
+                            ) : (
+                              <MessageBubble
+                                key={item.id} item={item} currentUser={currentUser}
+                                isSelected={selectedMsgId === item.id} isEditing={editingId === item.id}
+                                editingText={editingText} reactionPickerId={reactionPickerId}
+                                chatType={activeChat.type} reactionEmojis={reactionEmojis}
+                                contacts={contacts} getPeerName={getPeerName} contactLabel={contactLabel}
+                                isFailed={failedMsgIds.has(String(item.id))}
+                                onReply={msg => { setReplyingTo(msg); setReactionPickerId(null); setSelectedMsgId(null); }}
+                                onEditStart={(id, text) => { setEditingId(id); setEditingText(text); setReactionPickerId(null); setSelectedMsgId(null); }}
+                                onEditSave={saveEdit} onEditCancel={() => setEditingId(null)} onEditChange={setEditingText}
+                                onDelete={id => { deleteMsg(id); setSelectedMsgId(null); }}
+                                onReaction={sendReaction} onSetReactionPicker={setReactionPickerId}
+                                onViewFile={(url, type) => setViewFile({ url, type })} onSelectMsg={setSelectedMsgId}
+                                onRetry={retryMessage}
+                              />
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
                   )}
                 </div>
 
@@ -3304,14 +3966,37 @@ export default function FluxChat() {
                         {replyingTo.content.startsWith("[") ? "📎 Attachment" : replyingTo.content}
                       </div>
                     </div>
-                    <button onClick={() => setReplyingTo(null)} style={{ marginLeft: 8, padding: "4px 8px", border: "none", background: "none", cursor: "pointer", fontSize: 16, color: "var(--text-3)" }}>✕</button>
+                    <button onClick={() => setReplyingTo(null)} style={{ marginLeft: 8, padding: "4px 8px", border: "none", background: "none", cursor: "pointer", fontSize: 16, color: "var(--text-3)" }} aria-label="Cancel reply">✕</button>
                   </div>
                 )}
 
                 {showEmojis && (
-                  <div className="emoji-picker pop" onClick={e => e.stopPropagation()}>
-                    {emojis.map(e => (
-                      <button key={e} onClick={() => setInputMsg(prev => prev + e)} style={{ fontSize: 20, background: "none", border: "none", cursor: "pointer", padding: "4px", borderRadius: 4 }}>{e}</button>
+                  <div
+                    className="emoji-picker pop"
+                    onClick={e => e.stopPropagation()}
+                    role="grid"
+                    aria-label="Emoji picker"
+                  >
+                    {emojiRows.map((row, r) => (
+                      <div key={r} role="row" style={{ display: "flex", gap: "2px" }}>
+                        {row.map((e, c) => {
+                          const isFocused = r === focusedEmojiCoord.r && c === focusedEmojiCoord.c;
+                          return (
+                            <button
+                              key={e}
+                              ref={isFocused ? emojiActiveCellRef : null}
+                              tabIndex={isFocused ? 0 : -1}
+                              onClick={() => setInputMsg(prev => prev + e)}
+                              onKeyDown={ev => handleEmojiKeyDown(ev, r, c)}
+                              className="emoji-cell"
+                              role="gridcell"
+                              aria-label={e}
+                            >
+                              {e}
+                            </button>
+                          );
+                        })}
+                      </div>
                     ))}
                   </div>
                 )}
@@ -3320,26 +4005,34 @@ export default function FluxChat() {
                   {isRecording ? (
                     <div style={{ display: "flex", alignItems: "center", flex: 1, padding: "0 10px", gap: 16 }}>
                       <div className="rec-dot" style={{ position: "static", display: "inline-block", width: 10, height: 10 }}></div>
-                      <span style={{ color: "var(--red)", fontWeight: 600, flex: 1 }}>Recording {fmtDuration(recordingDuration)}</span>
+                      <span style={{ color: "var(--red)", fontWeight: 600, flex: 1 }}>Recording &middot; {fmtDuration(recordingDuration)}</span>
                       <button onClick={() => { cancelRecordingRef.current = true; toggleRecording(); }} style={{ color: "var(--text-3)", background: "none", border: "none", cursor: "pointer", fontSize: 14 }}>Cancel</button>
-                      <button onClick={toggleRecording} className="send-btn">➤</button>
+                      <button onClick={toggleRecording} className="send-btn" aria-label="Send voice message">➤</button>
                     </div>
                   ) : (
                     <>
                       <input type="file" ref={fileInputRef} onChange={handleFile} accept="image/*,audio/*,video/*,.pdf,.doc,.docx" className="hidden-input" />
                       <input type="file" ref={photoInputRef} onChange={handleFile} accept="image/*" capture="environment" className="hidden-input" />
                       <input type="file" ref={cameraInputRef} onChange={handleFile} accept="video/*" capture="environment" className="hidden-input" />
-                      <button onClick={e => { e.stopPropagation(); setShowEmojis(v => !v); }} className={`tool-btn ${showEmojis ? "tool-btn--on" : ""}`}>😀</button>
-                      <button onClick={() => photoInputRef.current?.click()} className="tool-btn" title="Take photo">
+                      <button
+                        ref={emojiToggleRef}
+                        onClick={e => { e.stopPropagation(); setShowEmojis(v => !v); }}
+                        className={`tool-btn ${showEmojis ? "tool-btn--on" : ""}`}
+                        aria-label="Choose emoji"
+                        aria-expanded={showEmojis}
+                      >
+                        😀
+                      </button>
+                      <button onClick={() => photoInputRef.current?.click()} className="tool-btn" title="Take photo" aria-label="Take photo">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M23 19a2 2 0 01-2 2H3a2 2 0 01-2-2V8a2 2 0 012-2h4l2-3h6l2 3h4a2 2 0 012 2z" /><circle cx="12" cy="13" r="4" /></svg>
                       </button>
-                      <button onClick={() => cameraInputRef.current?.click()} className="tool-btn" title="Record video">
+                      <button onClick={() => cameraInputRef.current?.click()} className="tool-btn" title="Record video" aria-label="Record video">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polygon points="23 7 16 12 23 17 23 7" /><rect x="1" y="5" width="15" height="14" rx="2" ry="2" /></svg>
                       </button>
-                      <button onClick={() => fileInputRef.current?.click()} className="tool-btn" title="Attach file">📎</button>
-                      <button onClick={toggleRecording} className={`tool-btn ${isRecording ? "tool-btn--rec" : ""}`} title="Voice message">🎤</button>
+                      <button onClick={() => fileInputRef.current?.click()} className="tool-btn" title="Attach file" aria-label="Attach file">📎</button>
+                      <button onClick={toggleRecording} className={`tool-btn ${isRecording ? "tool-btn--rec" : ""}`} title="Voice message" aria-label="Voice message">🎤</button>
                       <input value={inputMsg} onChange={handleTyping} onKeyDown={e => e.key === "Enter" && !e.shiftKey && sendMessage()} placeholder={isUploadingAttachment ? "Sending..." : "Type a message…"} className="msg-input" disabled={isRecording || isUploadingAttachment} />
-                      <button onClick={sendMessage} disabled={isRecording || isUploadingAttachment || (!inputMsg.trim() && !pendingFile)} className="send-btn">➤</button>
+                      <button onClick={sendMessage} disabled={isRecording || isUploadingAttachment || (!inputMsg.trim() && !pendingFile)} className="send-btn" aria-label="Send message">➤</button>
                     </>
                   )}
                 </div>
@@ -3355,7 +4048,7 @@ export default function FluxChat() {
           <div className="viewer-content cl-modal" onClick={e => e.stopPropagation()}>
             <div className="cl-header">
               <h2 className="cl-title">Call History</h2>
-              <button className="cl-close" onClick={() => setShowCallLogUI(false)}>✕</button>
+              <button className="cl-close" onClick={() => setShowCallLogUI(false)} aria-label="Close call history">✕</button>
             </div>
             {callLogs.length === 0 ? <p className="cl-empty">No recent calls</p> : (
               <div className="cl-list">
@@ -3392,8 +4085,24 @@ export default function FluxChat() {
                   ? { position: "relative", flex: 1, background: "#000", overflow: "hidden" }
                   : { position: "absolute", width: 0, height: 0, opacity: 0, overflow: "hidden", pointerEvents: "none" }
               }>
+              {/* Floating top timer bar */}
+              {isVideoCall && callState === "connected" && (
+                <div className="video-duration-overlay" style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ width: 6, height: 6, borderRadius: "50%", background: "#4ade80", boxShadow: "0 0 8px #4ade80" }}></span>
+                  <span style={{ opacity: 0.85, fontWeight: 550 }}>{callDisplayName}</span>
+                  <span style={{ width: 1, height: 12, background: "rgba(255, 255, 255, 0.2)" }}></span>
+                  <span>{fmtDuration(callDuration)}</span>
+                </div>
+              )}
+
               {isVideoSwapped ? (
-                <video autoPlay playsInline muted ref={node => { (localVideoRef as any).current = node; if (node && localStreamRef.current && node.srcObject !== localStreamRef.current) { node.srcObject = localStreamRef.current; node.play().catch(() => { }); } }} style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", background: "#000", zIndex: 1 }} />
+                <div style={{ position: "absolute", inset: 0, width: "100%", height: "100%", background: "#000", zIndex: 1 }}>
+                  <video autoPlay playsInline muted ref={node => { (localVideoRef as any).current = node; if (node && localStreamRef.current && node.srcObject !== localStreamRef.current) { node.srcObject = localStreamRef.current; node.play().catch(() => { }); } }} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                  <div style={{ position: "absolute", bottom: 12, left: 12, background: "rgba(0, 0, 0, 0.65)", color: "#fff", padding: "6px 12px", borderRadius: 16, fontSize: 13, fontWeight: 500, backdropFilter: "blur(4px)", pointerEvents: "none", zIndex: 5, border: "1px solid rgba(255,255,255,0.1)", display: "flex", alignItems: "center", gap: 6 }}>
+                    <span style={{ width: 6, height: 6, borderRadius: "50%", background: "#4ade80", boxShadow: "0 0 8px #4ade80" }}></span>
+                    You
+                  </div>
+                </div>
               ) : (
                 Object.keys(remoteStreams).length > 0
                   ? (
@@ -3401,13 +4110,63 @@ export default function FluxChat() {
                       {Object.entries(remoteStreams).map(([peerId, stream], _idx, arr) => {
                         const n = arr.length;
                         const height = `${Math.floor(100 / n)}%`;
+                        const isPeerCamOff = cameraStates[peerId] === true;
                         return (
-                          <video key={peerId} autoPlay playsInline ref={node => { if (node && node.srcObject !== stream) { node.srcObject = stream; node.play().catch(() => { }); } }} style={{ width: "100%", height, objectFit: "cover", background: "#000", flexShrink: 0, borderBottom: n > 1 ? "1px solid #222" : "none" }} />
+                          <div key={peerId} style={{ position: "relative", width: "100%", height, flexShrink: 0, borderBottom: _idx < n - 1 ? "1.5px solid rgba(255,255,255,0.15)" : "none", overflow: "hidden" }}>
+                            {isPeerCamOff ? (
+                              <div style={{ width: "100%", height: "100%", background: "#1a1a1a", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 8 }}>
+                                {(() => {
+                                  const peerContact = contacts.find(c => c.email === peerId);
+                                  const peerAvatar = peerContact?.avatar_url;
+                                  const peerInitial = (getPeerName(peerId))?.[0]?.toUpperCase() || "?";
+                                  return (
+                                    <div style={{ width: 64, height: 64, borderRadius: "50%", background: "var(--primary)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, color: "#fff", fontWeight: 700, overflow: "hidden", border: "2px solid rgba(255,255,255,0.15)" }}>
+                                      {peerAvatar ? <img src={peerAvatar} alt={getPeerName(peerId)} style={{ width: "100%", height: "100%", objectFit: "cover" }} /> : peerInitial}
+                                    </div>
+                                  );
+                                })()}
+                                <span style={{ fontSize: 10, color: "rgba(255,255,255,0.4)" }}>Camera Off</span>
+                              </div>
+                            ) : (
+                              <video autoPlay playsInline ref={node => { if (node && node.srcObject !== stream) { node.srcObject = stream; node.play().catch(() => { }); } }} style={{ width: "100%", height: "100%", objectFit: "cover", background: "#000" }} />
+                            )}
+                            <div style={{ position: "absolute", bottom: 12, left: 12, background: "rgba(0, 0, 0, 0.65)", color: "#fff", padding: "6px 12px", borderRadius: 16, fontSize: 13, fontWeight: 500, backdropFilter: "blur(4px)", pointerEvents: "none", zIndex: 5, border: "1px solid rgba(255,255,255,0.1)", display: "flex", alignItems: "center", gap: 6 }}>
+                              <span style={{ width: 6, height: 6, borderRadius: "50%", background: isPeerCamOff ? "#94a3b8" : "#4ade80", boxShadow: isPeerCamOff ? "none" : "0 0 8px #4ade80" }}></span>
+                              {(() => {
+                                const lbl = getPeerName(peerId);
+                                return lbl === "Unknown User" ? peerId.split("@")[0] : lbl;
+                              })()}
+                            </div>
+                          </div>
                         );
                       })}
                     </div>
                   )
-                  : <video autoPlay playsInline ref={node => { (remoteVideoRef as any).current = node; if (node && remoteStreamRef.current && node.srcObject !== remoteStreamRef.current) { node.srcObject = remoteStreamRef.current; node.play().catch(() => { }); } }} style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", background: "#000", zIndex: 1 }} />
+                  : (
+                    <div style={{ position: "absolute", inset: 0, width: "100%", height: "100%", background: "#000", zIndex: 1 }}>
+                      {remoteVideoMuted || (callPeer && cameraStates[callPeer]) ? (
+                        <div style={{ width: "100%", height: "100%", background: "#1a1a1a", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 12 }}>
+                          {(() => {
+                            const peerContact = contacts.find(c => c.email === callPeer);
+                            const peerAvatar = peerContact?.avatar_url;
+                            const peerInitial = (callDisplayName)?.[0]?.toUpperCase() || "?";
+                            return (
+                              <div style={{ width: 90, height: 90, borderRadius: "50%", background: "var(--primary)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 38, color: "#fff", fontWeight: 700, overflow: "hidden", border: "3px solid rgba(255,255,255,0.15)", boxShadow: "0 8px 24px rgba(0,0,0,0.4)" }}>
+                                {peerAvatar ? <img src={peerAvatar} alt={callDisplayName} style={{ width: "100%", height: "100%", objectFit: "cover" }} /> : peerInitial}
+                              </div>
+                            );
+                          })()}
+                          <span style={{ fontSize: 12, color: "rgba(255,255,255,0.4)", letterSpacing: "0.04em", textTransform: "uppercase" }}>Camera Off</span>
+                        </div>
+                      ) : (
+                        <video autoPlay playsInline ref={node => { (remoteVideoRef as any).current = node; if (node && remoteStreamRef.current && node.srcObject !== remoteStreamRef.current) { node.srcObject = remoteStreamRef.current; node.play().catch(() => { }); } }} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                      )}
+                      <div style={{ position: "absolute", bottom: 12, left: 12, background: "rgba(0, 0, 0, 0.65)", color: "#fff", padding: "6px 12px", borderRadius: 16, fontSize: 13, fontWeight: 500, backdropFilter: "blur(4px)", pointerEvents: "none", zIndex: 5, border: "1px solid rgba(255,255,255,0.1)", display: "flex", alignItems: "center", gap: 6 }}>
+                        <span style={{ width: 6, height: 6, borderRadius: "50%", background: (remoteVideoMuted || (callPeer && cameraStates[callPeer])) ? "#94a3b8" : "#4ade80", boxShadow: (remoteVideoMuted || (callPeer && cameraStates[callPeer])) ? "none" : "0 0 8px #4ade80" }}></span>
+                        {callDisplayName}
+                      </div>
+                    </div>
+                  )
               )}
 
               <div className="local-video-pip" style={{ left: pipPos.x, top: pipPos.y, cursor: "pointer", zIndex: 10 }} onMouseDown={onPipMouseDown} onTouchStart={onPipTouchStart} onClick={() => { if (!pipDragging.current) setIsVideoSwapped(v => !v); }} title="Tap to swap">
@@ -3418,13 +4177,59 @@ export default function FluxChat() {
                         {Object.entries(remoteStreams).map(([peerId, stream], _idx, arr) => {
                           const n = arr.length;
                           const height = `${Math.floor(100 / n)}%`;
+                          const isPeerCamOff = cameraStates[peerId] === true;
                           return (
-                            <video key={peerId} autoPlay playsInline ref={node => { if (node && node.srcObject !== stream) { node.srcObject = stream; node.play().catch(() => { }); } }} style={{ width: "100%", height, objectFit: "cover", background: "#000", flexShrink: 0 }} />
+                            <div key={peerId} style={{ position: "relative", width: "100%", height, flexShrink: 0, borderBottom: _idx < n - 1 ? "1px solid rgba(255,255,255,0.1)" : "none", overflow: "hidden" }}>
+                              {isPeerCamOff ? (
+                                <div style={{ width: "100%", height: "100%", background: "#1a1a1a", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 4 }}>
+                                  {(() => {
+                                    const peerContact = contacts.find(c => c.email === peerId);
+                                    const peerAvatar = peerContact?.avatar_url;
+                                    const peerInitial = (getPeerName(peerId))?.[0]?.toUpperCase() || "?";
+                                    return (
+                                      <div style={{ width: 32, height: 32, borderRadius: "50%", background: "var(--primary)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, color: "#fff", fontWeight: 700, overflow: "hidden", border: "1px solid rgba(255,255,255,0.15)" }}>
+                                        {peerAvatar ? <img src={peerAvatar} alt={getPeerName(peerId)} style={{ width: "100%", height: "100%", objectFit: "cover" }} /> : peerInitial}
+                                      </div>
+                                    );
+                                  })()}
+                                </div>
+                              ) : (
+                                <video autoPlay playsInline ref={node => { if (node && node.srcObject !== stream) { node.srcObject = stream; node.play().catch(() => { }); } }} style={{ width: "100%", height: "100%", objectFit: "cover", background: "#000" }} />
+                              )}
+                              <div style={{ position: "absolute", bottom: 4, left: 4, background: "rgba(0, 0, 0, 0.7)", color: "#fff", padding: "2px 6px", borderRadius: 8, fontSize: 9, fontWeight: 500, pointerEvents: "none", zIndex: 5 }}>
+                                {(() => {
+                                  const lbl = getPeerName(peerId);
+                                  return lbl === "Unknown User" ? peerId.split("@")[0] : lbl;
+                                })()}
+                              </div>
+                            </div>
                           );
                         })}
                       </div>
                     )
-                    : <video autoPlay playsInline ref={node => { (remoteVideoRef as any).current = node; if (node && remoteStreamRef.current && node.srcObject !== remoteStreamRef.current) { node.srcObject = remoteStreamRef.current; node.play().catch(() => { }); } }} />
+                    : (
+                      <div style={{ position: "relative", width: "100%", height: "100%", borderRadius: "inherit", overflow: "hidden" }}>
+                        {remoteVideoMuted || (callPeer && cameraStates[callPeer]) ? (
+                          <div style={{ width: "100%", height: "100%", background: "#1a1a1a", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 4 }}>
+                            {(() => {
+                              const peerContact = contacts.find(c => c.email === callPeer);
+                              const peerAvatar = peerContact?.avatar_url;
+                              const peerInitial = (callDisplayName)?.[0]?.toUpperCase() || "?";
+                              return (
+                                <div style={{ width: 32, height: 32, borderRadius: "50%", background: "var(--primary)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, color: "#fff", fontWeight: 700, overflow: "hidden", border: "1px solid rgba(255,255,255,0.15)" }}>
+                                  {peerAvatar ? <img src={peerAvatar} alt={callDisplayName} style={{ width: "100%", height: "100%", objectFit: "cover" }} /> : peerInitial}
+                                </div>
+                              );
+                            })()}
+                          </div>
+                        ) : (
+                          <video autoPlay playsInline ref={node => { (remoteVideoRef as any).current = node; if (node && remoteStreamRef.current && node.srcObject !== remoteStreamRef.current) { node.srcObject = remoteStreamRef.current; node.play().catch(() => { }); } }} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                        )}
+                        <div style={{ position: "absolute", bottom: 4, left: 4, background: "rgba(0, 0, 0, 0.7)", color: "#fff", padding: "2px 6px", borderRadius: 8, fontSize: 9, fontWeight: 500, pointerEvents: "none", zIndex: 5 }}>
+                          {callDisplayName}
+                        </div>
+                      </div>
+                    )
                 ) : (
                   /* Local stream — wrap in relative container so camera-off overlay stays inside PIP */
                   <div style={{ position: "relative", width: "100%", height: "100%" }}>
@@ -3437,26 +4242,12 @@ export default function FluxChat() {
                         <span style={{ fontSize: 8, color: "rgba(255,255,255,0.4)", letterSpacing: "0.04em", textTransform: "uppercase" }}>Cam off</span>
                       </div>
                     )}
+                    <div style={{ position: "absolute", bottom: 4, left: 4, background: "rgba(0, 0, 0, 0.7)", color: "#fff", padding: "2px 6px", borderRadius: 8, fontSize: 9, fontWeight: 500, pointerEvents: "none", zIndex: 5 }}>
+                      You
+                    </div>
                   </div>
                 )}
               </div>
-              {/* Camera-off overlay is now inside the PIP — see above */}
-              {/* Remote camera-off overlay — shows the remote peer's avatar centered in the main view */}
-              {isVideoCall && remoteVideoMuted && callState === "connected" && !isVideoSwapped && (
-                <div style={{ position: "absolute", inset: 0, zIndex: 5, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,0.75)", gap: 12 }}>
-                  {(() => {
-                    const peerContact = contacts.find(c => c.email === callPeer);
-                    const peerAvatar = peerContact?.avatar_url;
-                    const peerInitial = (callDisplayName)?.[0]?.toUpperCase() || "?";
-                    return (
-                      <div style={{ width: 90, height: 90, borderRadius: "50%", background: "var(--primary)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 38, color: "#fff", fontWeight: 700, overflow: "hidden", boxShadow: "0 4px 24px rgba(0,0,0,0.5)" }}>
-                        {peerAvatar ? <img src={peerAvatar} alt={callDisplayName} style={{ width: "100%", height: "100%", objectFit: "cover" }} /> : peerInitial}
-                      </div>
-                    );
-                  })()}
-                  <span style={{ color: "rgba(255,255,255,0.7)", fontSize: 13 }}>Camera is off</span>
-                </div>
-              )}
             </div>
 
             {(!isVideoCall || callState !== "connected") && (
@@ -3473,17 +4264,17 @@ export default function FluxChat() {
             <div className="call-controls" style={isVideoCall && callState === "connected" ? { position: "absolute", bottom: 24, left: 0, right: 0, zIndex: 20, display: "flex", justifyContent: "center", gap: 16 } : {}}>
               {callState === "incoming" ? (
                 <>
-                  <button onClick={rejectCall} className="call-btn btn-reject"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg></button>
-                  <button onClick={acceptCall} className="call-btn btn-accept"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07A19.5 19.5 0 014.69 12a19.79 19.79 0 01-3.07-8.67A2 2 0 013.6 1.37h3a2 2 0 012 1.72c.127.96.361 1.903.7 2.81a2 2 0 01-.45 2.11L7.91 9a16 16 0 006.09 6.09l1.97-1.85a2 2 0 012.11-.45c.907.339 1.85.573 2.81.7a2 2 0 011.72 2.03z" /></svg></button>
+                  <button onClick={rejectCall} className="call-btn btn-reject" aria-label="Reject call"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg></button>
+                  <button onClick={acceptCall} className="call-btn btn-accept" aria-label="Accept call"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07A19.5 19.5 0 014.69 12a19.79 19.79 0 01-3.07-8.67A2 2 0 013.6 1.37h3a2 2 0 012 1.72c.127.96.361 1.903.7 2.81a2 2 0 01-.45 2.11L7.91 9a16 16 0 006.09 6.09l1.97-1.85a2 2 0 012.11-.45c.907.339 1.85.573 2.81.7a2 2 0 011.72 2.03z" /></svg></button>
                 </>
               ) : callState === "connected" ? (
                 <>
-                  <button onClick={toggleMute} className={`call-btn btn-secondary ${isMuted ? "active-mute" : ""}`}>
+                  <button onClick={toggleMute} className={`call-btn btn-secondary ${isMuted ? "active-mute" : ""}`} aria-label={isMuted ? "Unmute microphone" : "Mute microphone"}>
                     {isMuted ? <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" /><line x1="1" y1="1" x2="23" y2="23" /></svg>
                       : <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" /><path d="M19 10v2a7 7 0 0 1-14 0v-2" /><line x1="12" y1="19" x2="12" y2="23" /><line x1="8" y1="23" x2="16" y2="23" /></svg>}
                   </button>
                   {isVideoCall && (
-                    <button onClick={switchCamera} className="call-btn btn-secondary">
+                    <button onClick={switchCamera} className="call-btn btn-secondary" aria-label="Switch camera">
                       <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="1 4 1 10 7 10" /><polyline points="23 20 23 14 17 14" /><path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 0 1 3.51 15" /></svg>
                     </button>
                   )}
@@ -3493,24 +4284,31 @@ export default function FluxChat() {
                       const newOff = !isCameraOff;
                       tracks.forEach(t => { t.enabled = !newOff; });
                       setIsCameraOff(newOff);
-                      // Signal the remote peer so they can show our avatar
-                      wsSend(JSON.stringify({ type: "camera_state", target_user: callPeer, videoMuted: newOff }));
-                    }} className={`call-btn btn-secondary ${isCameraOff ? "active-mute" : ""}`} title={isCameraOff ? "Turn camera on" : "Turn camera off"}>
+                      // Signal all peers so they can show our avatar
+                      if (callPeer) {
+                        wsSend(JSON.stringify({ type: "camera_state", target_user: callPeer, videoMuted: newOff }));
+                      }
+                      pcMapRef.current.forEach((_, peerEmail) => {
+                        if (peerEmail !== callPeer) {
+                          wsSend(JSON.stringify({ type: "camera_state", target_user: peerEmail, videoMuted: newOff }));
+                        }
+                      });
+                    }} className={`call-btn btn-secondary ${isCameraOff ? "active-mute" : ""}`} title={isCameraOff ? "Turn camera on" : "Turn camera off"} aria-label={isCameraOff ? "Turn camera on" : "Turn camera off"}>
                       {isCameraOff
                         ? <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="1" y1="1" x2="23" y2="23" /><path d="M21 21H3a2 2 0 01-2-2V8a2 2 0 012-2h3m3-3h6l2 3h4a2 2 0 012 2v9.34" /><path d="M10.73 6H16" /></svg>
                         : <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polygon points="23 7 16 12 23 17 23 7" /><rect x="1" y="5" width="15" height="14" rx="2" /></svg>
                       }
                     </button>
                   )}
-                  <button onClick={toggleSpeaker} className={`call-btn btn-secondary ${!isSpeaker ? "active-mute" : ""}`}>
+                  <button onClick={toggleSpeaker} className={`call-btn btn-secondary ${!isSpeaker ? "active-mute" : ""}`} aria-label={isSpeaker ? "Switch to earpiece" : "Switch to speaker"}>
                     {isSpeaker
                       ? <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" /><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07" /></svg>
                       : <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07A19.5 19.5 0 014.69 12a19.79 19.79 0 01-3.07-8.67A2 2 0 013.6 1.37h3a2 2 0 012 1.72c.127.96.361 1.903.7 2.81a2 2 0 01-.45 2.11L7.91 9a16 16 0 006.09 6.09l1.97-1.85a2 2 0 012.11-.45c.907.339 1.85.573 2.81.7a2 2 0 011.72 2.03z" /></svg>}
                   </button>
-                  <button onClick={() => endCall(true)} className="call-btn btn-end"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg></button>
+                  <button onClick={() => endCall(true)} className="call-btn btn-end" aria-label="End call"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg></button>
                 </>
               ) : (
-                <button onClick={() => endCall(true)} className="call-btn btn-end"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg></button>
+                <button onClick={() => endCall(true)} className="call-btn btn-end" aria-label="End call"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg></button>
               )}
             </div>
           </div>
@@ -3520,7 +4318,7 @@ export default function FluxChat() {
       {/* ── PENDING FILE PREVIEW OVERLAY ── */}
       {pendingFile && (
         <div className="file-viewer-overlay" style={{ zIndex: 10000 }}>
-          <button className="close-viewer" onClick={() => setPendingFile(null)}>✕</button>
+          <button className="close-viewer" onClick={() => setPendingFile(null)} aria-label="Cancel file attachment">✕</button>
           <div className="viewer-content">
             {pendingFile.type === "image" && <img src={pendingFile.url} alt="preview" />}
             {pendingFile.type === "video" && <video src={pendingFile.url} controls autoPlay />}
@@ -3536,7 +4334,7 @@ export default function FluxChat() {
       {/* ── FILE VIEWER ── */}
       {viewFile && (
         <div className="file-viewer-overlay" onClick={() => { setViewFile(null); setMediaZoom(1); setMediaPan({ x: 0, y: 0 }); }}>
-          <button className="close-viewer" onClick={() => { setViewFile(null); setMediaZoom(1); setMediaPan({ x: 0, y: 0 }); }}>✕</button>
+          <button className="close-viewer" onClick={() => { setViewFile(null); setMediaZoom(1); setMediaPan({ x: 0, y: 0 }); }} aria-label="Close media viewer">✕</button>
 
           <div className="viewer-actions" style={{ position: "absolute", top: 16, right: 60, display: "flex", gap: 12, zIndex: 9999 }} onClick={e => e.stopPropagation()}>
             {viewFile.type !== "avatar-circle" && (
@@ -3575,6 +4373,19 @@ export default function FluxChat() {
             {viewFile.type === "image" && <img src={viewFile.url} alt="attachment" style={{ pointerEvents: "none" }} />}
             {viewFile.type === "video" && <video src={viewFile.url} controls autoPlay />}
             {viewFile.type === "avatar-circle" && <img src={viewFile.url} alt="Avatar" style={{ pointerEvents: "none", maxWidth: "100%", maxHeight: "100%", objectFit: "contain" }} />}
+          </div>
+        </div>
+      )}
+
+      {toast && (
+        <div className="toast-container">
+          <div className={`toast-notification toast-notification--${toast.type}`}>
+            <span className="toast-icon">
+              {toast.type === "success" && "✓"}
+              {toast.type === "error" && "✕"}
+              {toast.type === "info" && "ℹ"}
+            </span>
+            <span>{toast.message}</span>
           </div>
         </div>
       )}
