@@ -2,10 +2,10 @@ import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Pulse",
+  title: "Flux",
   description: "Keep your conversations flowing with real-time speed.",
   icons: {
-    icon: "/icon.svg",   // 👈 Updated to use your new logo
+    icon: "/icon.png",
   },
 };
 

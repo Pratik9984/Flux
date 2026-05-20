@@ -1,8 +1,9 @@
-import type { NextConfig } from "next";
-
-const nextConfig: NextConfig = {
-  turbopack: {
-    root: process.cwd(),
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  output: 'export',
+  // Next.js Image component needs this for static exports
+  images: {
+    unoptimized: true,
   },
 };
 
