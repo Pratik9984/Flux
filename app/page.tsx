@@ -2576,6 +2576,48 @@ export default function FluxChat() {
     setReplyingTo(null);
   };
 
+  const sendForward = useCallback(async (target: Chat) => {
+    if (!forwardingMsg) return;
+    const { type, id } = target;
+    const tempId = `temp-${Date.now()}-${Math.random()}`;
+    const optimisticMsg: Message = {
+      id: tempId, user: currentUser,
+      content: forwardingMsg.content,
+      timestamp: new Date().toISOString(),
+      is_forwarded: true,
+      forwarded_from_id: forwardingMsg.id,
+      ...(type === "user" ? { target_user: String(id) } : { group_id: id, group_name: target.name }),
+    };
+
+    // Only add optimistic msg if the target is the active chat
+    if (activeChatRef.current && String(activeChatRef.current.id) === String(id)) {
+      setMessages(prev => {
+        const next = [...prev, optimisticMsg];
+        setMessagesCache(cache => ({ ...cache, [String(id)]: next }));
+        return next;
+      });
+      setTimeout(scrollBottom, 50);
+    }
+
+    updateActivity(id, forwardingMsg.content);
+
+    wsSend(JSON.stringify({
+      type: type === "user" ? "direct_message" : "group_message",
+      content: forwardingMsg.content,
+      message_type: forwardingMsg.content.startsWith("[IMAGE]") ? "image"
+                  : forwardingMsg.content.startsWith("[AUDIO]") ? "audio"
+                  : forwardingMsg.content.startsWith("[VIDEO]") ? "video"
+                  : "text",
+      is_forwarded: true,
+      forwarded_from_id: forwardingMsg.id,
+      ...(type === "user" ? { target_user: id } : { group_id: id }),
+    }));
+
+    setForwardingMsg(null);
+    setShowForwardPicker(false);
+    showToast("Message forwarded", "success");
+  }, [forwardingMsg, currentUser, wsSend, updateActivity, scrollBottom, showToast]);
+
   const retryMessage = useCallback(async (msg: Message) => {
     if (!activeChat) return;
     const tid = String(msg.id);
