@@ -1026,6 +1026,8 @@ export default function FluxChat() {
   const [editingText, setEditingText] = useState("");
   const [typingSet, setTypingSet] = useState<Set<string>>(new Set());
   const [replyingTo, setReplyingTo] = useState<Message | null>(null);
+  const [forwardingMsg, setForwardingMsg] = useState<Message | null>(null);
+  const [showForwardPicker, setShowForwardPicker] = useState(false);
   const [reactionPickerId, setReactionPickerId] = useState<string | number | null>(null);
   const [selectedMsgId, setSelectedMsgId] = useState<string | number | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
