@@ -3893,21 +3893,7 @@ export default function FluxChat() {
                         position: "relative",
                       }}
                     >
-                      {rowVirtualizer.getVirtualItems().map((virtualRow) => {
-                        const item = groupedMessages[virtualRow.index];
-                        if (!item) return null;
-                        return (
-                          <div
-                            key={virtualRow.key}
-                            ref={rowVirtualizer.measureElement}
-                            data-index={virtualRow.index}
-                            style={{
-                              position: "absolute",
-                              top: 0,
-                              left: 0,
-                              width: "100%",
-                              transform: `translateY(${virtualRow.start}px)`,
-                            }}
+                      
                           >
                             {item.type === "divider" ? (
                               <div className="date-sep"><span>{item.label}</span></div>
