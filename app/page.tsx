@@ -312,6 +312,7 @@ interface MessageBubbleProps {
   isFailed: boolean;
   getPeerName: (email: string) => string; contactLabel: (c: Contact) => string;
   onReply: (msg: Message) => void;
+  onForward: (msg: Message) => void;
   onEditStart: (id: string | number, text: string) => void;
   onEditSave: () => void; onEditCancel: () => void; onEditChange: (text: string) => void;
   onDelete: (id: string | number) => void;
@@ -324,7 +325,7 @@ interface MessageBubbleProps {
 const MessageBubble = memo(function MessageBubble({
   item, currentUser, isSelected, isEditing, editingText, reactionPickerId, chatType,
   reactionEmojis, contacts, isFailed, getPeerName, contactLabel,
-  onReply, onEditStart, onEditSave, onEditCancel, onEditChange,
+  onReply, onForward, onEditStart, onEditSave, onEditCancel, onEditChange,
   onDelete, onReaction, onSetReactionPicker, onViewFile, onSelectMsg, onRetry,
 }: MessageBubbleProps) {
   const isMine = item.user === currentUser;
@@ -569,6 +570,11 @@ const MessageBubble = memo(function MessageBubble({
                   onTouchEnd={e => { e.stopPropagation(); touchHandledClick.current = true; onReply(item); }}
                   className="bubble-action-btn" title="Reply" aria-label="Reply to message"
                 >↩</button>
+                <button
+                  onMouseDown={e => { e.stopPropagation(); onForward(item); }}
+                  onTouchEnd={e => { e.stopPropagation(); touchHandledClick.current = true; onForward(item); }}
+                  className="bubble-action-btn" title="Forward" aria-label="Forward message"
+                >↗</button>
                 {isMine && (
                   <>
                     <button
@@ -3945,6 +3951,7 @@ export default function FluxChat() {
                                 contacts={contacts} getPeerName={getPeerName} contactLabel={contactLabel}
                                 isFailed={failedMsgIds.has(String(item.id))}
                                 onReply={msg => { setReplyingTo(msg); setReactionPickerId(null); setSelectedMsgId(null); }}
+                                onForward={msg => { setForwardingMsg(msg); setShowForwardPicker(true); setSelectedMsgId(null); }}
                                 onEditStart={(id, text) => { setEditingId(id); setEditingText(text); setReactionPickerId(null); setSelectedMsgId(null); }}
                                 onEditSave={saveEdit} onEditCancel={() => setEditingId(null)} onEditChange={setEditingText}
                                 onDelete={id => { deleteMsg(id); setSelectedMsgId(null); }}
