@@ -492,6 +492,16 @@ const MessageBubble = memo(function MessageBubble({
             onClick={handleClick}
             onContextMenu={handleContextMenu}
           >
+            {item.is_forwarded && (
+              <div style={{
+                display: "flex", alignItems: "center", gap: 4,
+                fontSize: 11, color: "var(--text-3)",
+                marginBottom: 4, fontStyle: "italic", opacity: 0.8,
+              }}>
+                <span>↗</span><span>Forwarded</span>
+              </div>
+            )}
+
             {item.reply_to_content && (
               <div className="quoted-message">
                 <div className="quoted-bar"></div>
