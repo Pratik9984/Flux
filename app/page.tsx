@@ -3140,17 +3140,7 @@ export default function FluxChat() {
   const formatDate = (ts: string) => { const d = parseTs(ts); const today = new Date(); if (d.toDateString() === today.toDateString()) return "Today"; const yesterday = new Date(today); yesterday.setDate(today.getDate() - 1); if (d.toDateString() === yesterday.toDateString()) return "Yesterday"; return d.toLocaleDateString([], { month: "short", day: "numeric" }); };
   const groupedMessages = useMemo(() => { const out: GroupedMessage[] = []; let lastDate: string | null = null; for (const msg of messages) { const label = formatDate(msg.timestamp); if (label !== lastDate) { out.push({ type: "divider", label }); lastDate = label; } out.push({ type: "msg", ...msg }); } return out; }, [messages]); // eslint-disable-line
 
-  const rowVirtualizer = useVirtualizer({
-    count: groupedMessages.length,
-    getScrollElement: () => msgListRef.current,
-    estimateSize: () => 60,
-    overscan: 10,
-    gap: 2,
-    getItemKey: useCallback((index: number) => {
-      const item = groupedMessages[index];
-      return item ? (item.type === "divider" ? `div-${item.label}-${index}` : item.id) : index;
-    }, [groupedMessages]),
-  });
+
 
   const handleAppClick = useCallback(() => { setSidebarDeleteId(null); setReactionPickerId(null); setSelectedMsgId(null); }, []);
   const checkUsernameAvailability = useDebounceCallback(async (value: string) => { if (value.length >= 3) { try { const res = await apiFetch<{ available: boolean }>(`/auth/check-username/${value}`); if (!res.available) dispatchAuth({ type: "SET_ERROR", value: "Username already taken" }); } catch { } } }, 500);
