@@ -1,23 +1,11 @@
 "use client";
 
-// ─── Flux v5.7 — Call notification & ringtone reliability fixes ──────────────
-//  Fixed: FCM/WS call_offer now triggers ringtone IMMEDIATELY before any await
-//  Fixed: startRingtone retries up to 3× on failure (native + web)
-//  Fixed: notifyCall fires synchronously at the top of call_offer handler
-//  Fixed: sessionStorage call offer checked every 5 s on native (not just on focus)
-//  Fixed: Audio pre-warm happens at app mount AND on WS connect, not just on touch
-//  Fixed: pendingRemoteDescriptionRef persisted to sessionStorage before async ops
-//  Fixed: rejectCall / endCall cancel Capacitor notification reliably
-//  Fixed: call_offer handler fully synchronous UI path; DB work moved to background
-// ──────────────────────────────────────────────────────────────────────────────
-
 import React, {
   useState, useEffect, useRef, useMemo, useCallback,
   useReducer, useLayoutEffect, memo,
 } from "react";
 import { createPortal } from "react-dom";
 import "./globals.css";
-import { useVirtualizer } from "@tanstack/react-virtual";
 import { requestNotificationPermission as requestFCMPermission } from "@/lib/firebase";
 import {
   getOrCreateIdentityKeyPair,
