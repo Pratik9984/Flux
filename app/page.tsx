@@ -81,6 +81,7 @@ type Message = {
   edited_at?: string; reply_to_id?: string | number; reply_to_content?: string;
   reactions?: Record<string, string[]>; read_by?: string[];
   sender_name?: string; sender_avatar?: string; _callRecord?: boolean;
+  is_forwarded?: boolean; forwarded_from_id?: string | number;
 };
 type GroupedMessage = { type: "divider"; label: string } | ({ type: "msg" } & Message);
 type CallState = "idle" | "incoming" | "calling" | "connected";
