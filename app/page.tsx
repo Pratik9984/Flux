@@ -4449,6 +4449,68 @@ export default function FluxChat() {
         </div>
       )}
 
+      {showForwardPicker && forwardingMsg && (
+        <div className="file-viewer-overlay" style={{ zIndex: 10001 }} onClick={() => setShowForwardPicker(false)}>
+          <div
+            className="viewer-content cl-modal"
+            style={{ maxHeight: "70vh", overflowY: "auto", padding: 0 }}
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="cl-header">
+              <h2 className="cl-title">Forward to…</h2>
+              <button className="cl-close" onClick={() => setShowForwardPicker(false)}>✕</button>
+            </div>
+
+            {/* Message preview */}
+            <div style={{ padding: "10px 16px", background: "var(--surface-2)", borderBottom: "1px solid var(--border)", fontSize: 12, color: "var(--text-3)", display: "flex", alignItems: "center", gap: 6 }}>
+              <span>↗</span>
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {forwardingMsg.content.startsWith("[") ? "📎 Attachment" : forwardingMsg.content}
+              </span>
+            </div>
+
+            {/* Contacts */}
+            {sortedContacts.length > 0 && (
+              <>
+                <div style={{ padding: "8px 16px 4px", fontSize: 11, fontWeight: 700, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.06em" }}>Contacts</div>
+                {sortedContacts.map(c => (
+                  <button key={c.email} className="sb-item" style={{ width: "100%", borderRadius: 0 }}
+                    onClick={() => sendForward({ type: "user", id: c.email, name: contactLabel(c) })}>
+                    <div className="sb-av">
+                      {c.avatar_url ? <img src={c.avatar_url} className="img-cover rounded-circle" alt="av" /> : (contactLabel(c)[0]?.toUpperCase() || "?")}
+                      <span className={`pres ${c.is_online ? "pres--on" : ""}`}></span>
+                    </div>
+                    <div className="sb-item-body mw-0">
+                      <span className="sb-item-name">{contactLabel(c)}</span>
+                      {c.username && <span className="sb-item-status">@{c.username}</span>}
+                    </div>
+                  </button>
+                ))}
+              </>
+            )}
+
+            {/* Groups */}
+            {sortedGroups.length > 0 && (
+              <>
+                <div style={{ padding: "8px 16px 4px", fontSize: 11, fontWeight: 700, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.06em" }}>Groups</div>
+                {sortedGroups.map(g => (
+                  <button key={g.id} className="sb-item" style={{ width: "100%", borderRadius: 0 }}
+                    onClick={() => sendForward({ type: "group", id: g.id, name: g.name })}>
+                    <div className="sb-av sb-av--group">
+                      {g.avatar_url ? <img src={g.avatar_url} className="img-cover rounded-circle" alt="av" /> : (g.name[0]?.toUpperCase() || "?")}
+                    </div>
+                    <div className="sb-item-body mw-0">
+                      <span className="sb-item-name">{g.name}</span>
+                      <span className="sb-item-status">{g.members.length} members</span>
+                    </div>
+                  </button>
+                ))}
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
       {toast && (
         <div className="toast-container">
           <div className={`toast-notification toast-notification--${toast.type}`}>
