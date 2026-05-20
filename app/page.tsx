@@ -3894,7 +3894,6 @@ export default function FluxChat() {
                       }}
                     >
                       
-                          >
                             {item.type === "divider" ? (
                               <div className="date-sep"><span>{item.label}</span></div>
                             ) : (
