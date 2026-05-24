@@ -1,6 +1,6 @@
 {
   "name": "Flux",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "scripts": {
     "dev": "next dev",
@@ -15,6 +15,7 @@
     "@capacitor/app": "^8.1.0",
     "@capacitor/camera": "^8.2.0",
     "@capacitor/core": "^8.3.1",
+    "@capacitor/filesystem": "^8.1.2",
     "@capacitor/local-notifications": "^8.1.0",
     "@capacitor/push-notifications": "^8.0.4",
     "@capawesome/capacitor-background-task": "^8.0.2",
