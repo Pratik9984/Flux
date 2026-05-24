@@ -2135,7 +2135,7 @@ export default function FluxChat() {
     if (chatId && isChatMuted(chatId)) return;
     if (chatId && activeChatRef.current && String(activeChatRef.current.id) === chatId) return;
     playNotificationSound();
-    if (IS_NATIVE || !isAppActiveRef.current || !document.hasFocus()) showLocalNotification(title, body, chatId);
+    if (IS_NATIVE || !isAppActiveRef.current || !document.hasFocus()) showLocalNotification(title, body);
   }, [playNotificationSound, isChatMuted]);
 
   const notifyCall = useCallback((title: string, body: string) => {
