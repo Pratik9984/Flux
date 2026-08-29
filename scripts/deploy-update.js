@@ -1,8 +1,35 @@
+// scripts/deploy-update.js
+// Usage: node scripts/deploy-update.js <version>
+// Env:   ADMIN_TOKEN  — your backend JWT (from /auth/login)
+//        HF_TOKEN     — (optional) HuggingFace write token to set secrets automatically
 
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const { execSync } = require("child_process");
+
+// Automatically load environment variables from .env.local if present
+try {
+  const envLocalPath = path.join(__dirname, "..", ".env.local");
+  if (fs.existsSync(envLocalPath)) {
+    const envLines = fs.readFileSync(envLocalPath, "utf-8").split(/\r?\n/);
+    for (const line of envLines) {
+      const match = line.match(/^\s*([^#=]+)\s*=\s*(.*)\s*$/);
+      if (match) {
+        const key = match[1].trim();
+        let val = match[2].trim();
+        if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+          val = val.slice(1, -1);
+        }
+        if (!process.env[key]) {
+          process.env[key] = val;
+        }
+      }
+    }
+  }
+} catch (e) {
+  console.log("⚠️ Could not auto-load .env.local:", e.message);
+}
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://54.253.245.248:7860";
 const version = process.argv[2];
@@ -11,7 +38,7 @@ const hfToken = process.env.HF_TOKEN ? process.env.HF_TOKEN.trim() : undefined;
 const hfRepo = process.env.HF_REPO ? process.env.HF_REPO.trim() : "";
 
 if (!version) {
-  console.error("Usage: node scripts/deploy.js 1.2.3");
+  console.error("Usage: node scripts/deploy-update.js 1.2.3");
   process.exit(1);
 }
 if (!adminToken) {
@@ -46,9 +73,17 @@ async function run() {
     });
     if (authRes.ok) {
       const { access_token } = await authRes.json();
-      if (access_token) { token = access_token; console.log("▶  Exchanged Supabase → backend JWT"); }
+      if (access_token) {
+        token = access_token;
+        console.log("▶  Exchanged Supabase → backend JWT successfully");
+      }
+    } else {
+      const errTxt = await authRes.text();
+      console.log(`⚠️  Token exchange at /auth/login returned ${authRes.status}: ${errTxt}`);
     }
-  } catch { /* already have a backend JWT */ }
+  } catch (err) {
+    console.log("⚠️  Token exchange failed:", err.message);
+  }
 
   // 5. Upload — send as application/zip (backend accepts it + magic-byte check agrees)
   console.log(`▶  Uploading to ${API_URL}/upload ...`);
@@ -66,7 +101,7 @@ async function run() {
 
   const upRes = await fetch(`${API_URL}/upload`, {
     method: "POST",
-    headers: {
+    headers: { 
       Authorization: `Bearer ${token}`,
       "X-App-Version": version,
       "X-App-Checksum": checksum

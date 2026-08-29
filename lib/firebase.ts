@@ -38,4 +38,46 @@ export async function requestNotificationPermission(): Promise<string | null> {
     }
 }
 
+/**
+ * Sets up foreground FCM message handling and token refresh.
+ * - onForegroundMessage: called when a push arrives while the app is in the foreground
+ * - onTokenRefresh: called with the new token when FCM rotates it
+ */
+export function setupForegroundFCM(
+    onForegroundMessage: (payload: any) => void,
+    onTokenRefresh: (newToken: string) => void,
+): (() => void) | null {
+    if (!messaging) return null;
+
+    // Listen for foreground push messages
+    const unsubMessage = onMessage(messaging, (payload) => {
+        onForegroundMessage(payload);
+    });
+
+    // Periodically check for token refresh (FCM doesn't have a dedicated onTokenRefresh event in v9+)
+    // Re-fetch token every 30 minutes; if it changed, notify the caller
+    let lastKnownToken: string | null = null;
+    const refreshInterval = setInterval(async () => {
+        try {
+            const sw = await navigator.serviceWorker.ready;
+            const freshToken = await getToken(messaging!, {
+                vapidKey: VAPID_KEY,
+                serviceWorkerRegistration: sw,
+            });
+            if (freshToken && freshToken !== lastKnownToken) {
+                if (lastKnownToken !== null) {
+                    // Token actually changed (not initial fetch)
+                    onTokenRefresh(freshToken);
+                }
+                lastKnownToken = freshToken;
+            }
+        } catch { }
+    }, 30 * 60 * 1000);
+
+    return () => {
+        unsubMessage();
+        clearInterval(refreshInterval);
+    };
+}
+
 export { onMessage };

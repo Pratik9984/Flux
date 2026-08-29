@@ -13,6 +13,12 @@ firebase.initializeApp({
 const messaging = firebase.messaging();
 
 messaging.onBackgroundMessage((payload) => {
+    // If it's a silent data message (e.g. typing indicator, RTC signaling), do not show a notification
+    if (!payload.notification || (!payload.notification.title && !payload.notification.body)) {
+        console.log("Silent background message received, ignoring visual notification:", payload);
+        return;
+    }
+
     const data = payload.data || {};
     const isCall = data.type === 'call';
 
@@ -36,6 +42,7 @@ messaging.onBackgroundMessage((payload) => {
 self.addEventListener('notificationclick', (event) => {
     event.notification.close();
     const data = event.notification.data || {};
+    const chatId = data.chatId || '';
     event.waitUntil(
         self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(clients => {
             if (event.action === 'reject') {
@@ -44,8 +51,13 @@ self.addEventListener('notificationclick', (event) => {
                 return;
             }
             const app = clients.find(c => c.url.includes(self.location.origin));
-            if (app) { app.focus(); app.postMessage({ type: 'NOTIFICATION_CLICK', data: data }); }
-            else self.clients.openWindow('/');
+            if (app) {
+                app.focus();
+                app.postMessage({ type: 'NOTIFICATION_CLICK', data: data });
+            } else {
+                const targetUrl = '/?openChat=' + encodeURIComponent(chatId);
+                self.clients.openWindow(targetUrl);
+            }
         })
     );
 });
