@@ -5,6 +5,7 @@ import { formatTimeAgo } from "@/lib/utils";
 import type { Group } from "@/types";
 import { useChatStore } from "@/stores/chatStore";
 import { useContactStore } from "@/stores/contactStore";
+import { AvatarImage } from "@/components/ui/AvatarImage";
 
 export interface GroupItemProps {
   group: Group;
@@ -71,11 +72,12 @@ const GroupItem = memo(function GroupItem({
         className={`sb-item ${isActive ? "sb-item--active-group" : ""} ${hasUnread && !isActive ? "sb-item--unread" : ""}`}
       >
         <div className="sb-av sb-av--group" onClick={(e) => { e.stopPropagation(); onOpenProfile?.(g.id, g.name); }}>
-          {g.avatar_url ? (
-            <img src={g.avatar_url} alt="group" className="img-cover rounded-circle" />
-          ) : (
-            g.name?.[0]?.toUpperCase() || "?"
-          )}
+          <AvatarImage
+            src={g.avatar_url}
+            alt={g.name}
+            fallbackText={g.name}
+            className="img-cover rounded-circle"
+          />
         </div>
         <div className="sb-item-body mw-0">
           <span className="sb-item-name" style={{ display: "flex", alignItems: "center", gap: 6 }}>

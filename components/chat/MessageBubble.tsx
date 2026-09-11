@@ -7,6 +7,7 @@ import { useAuthStore } from "@/stores/authStore";
 import { useContactStore } from "@/stores/contactStore";
 import { useCachedMedia } from "@/hooks/useCachedMedia";
 import ReactionPickerPortal from "./ReactionPickerPortal";
+import FormattedMessageText from "./FormattedMessageText";
 
 // ─── STATIC REACTION EMOJIS ──────────────────────────────────────────────────
 const REACTION_EMOJIS = ["👍", "❤️", "😂", "😮", "😢", "🙏", "🔥", "💯"];
@@ -92,6 +93,7 @@ export interface MessageBubbleProps {
   onRetry: (msg: Message) => void;
   highlightedMsgId: string | number | null;
   onCallTap?: (video: boolean) => void;
+  onJumpToMessage?: (id: string | number) => void;
 }
 
 const MessageBubble = memo(function MessageBubble({
@@ -118,20 +120,27 @@ const MessageBubble = memo(function MessageBubble({
   onRetry,
   highlightedMsgId,
   onCallTap,
+  onJumpToMessage,
 }: MessageBubbleProps) {
   const currentUser = useAuthStore((s) => s.currentUser);
   const contacts = useContactStore((s) => s.contacts);
   const nicknames = useContactStore((s) => s.nicknames);
 
   const contactLabel = (c: Contact) =>
-    nicknames[c.email] || c.display_name || (c.username ? `@${c.username}` : null) || "Unknown User";
+    nicknames[c.email.toLowerCase()] || nicknames[c.email] || c.display_name || (c.username ? `@${c.username}` : null) || (c.email ? c.email.split("@")[0] : "User");
 
-  const getPeerName = (email: string) => {
-    const c = contacts.find((contact) => contact.email === email);
-    return c ? contactLabel(c) : "Unknown User";
+  const getPeerName = (emailOrUser: string) => {
+    if (!emailOrUser) return "You";
+    const clean = String(emailOrUser).toLowerCase().trim();
+    const myClean = (currentUser || "").toLowerCase().trim();
+    if (clean === myClean) return "You";
+    const c = contacts.find((contact) => contact.email.toLowerCase() === clean);
+    if (c) return contactLabel(c);
+    if (clean.includes("@")) return clean.split("@")[0];
+    return emailOrUser;
   };
 
-  const isMine = item.user === currentUser;
+  const isMine = item.user?.toLowerCase() === currentUser?.toLowerCase();
   const formatTime = (ts: string) => parseTs(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   const bubbleRef = useRef<HTMLDivElement>(null);
   const touchStartX = useRef(0);
@@ -142,14 +151,91 @@ const MessageBubble = memo(function MessageBubble({
   const touchHandledClick = useRef(false);
   const [swipeX, setSwipeX] = useState(0);
 
-  // Resolve media cache url at component root
   const content = (item.content || "").trim();
+
+  // ── SYSTEM NOTICES (e.g. Member added / left) ─────────────────────────────
+  if (content.startsWith("[SYSTEM] member_added:")) {
+    const rawData = content.replace("[SYSTEM] member_added:", "").trim();
+    const [addedMemberEmail, adminEmail] = rawData.split(":");
+    const adminLabel = (adminEmail || item.user)?.toLowerCase() === currentUser?.toLowerCase() ? "You" : getPeerName(adminEmail || item.user);
+    const memberLabel = addedMemberEmail?.toLowerCase() === currentUser?.toLowerCase() ? "You" : getPeerName(addedMemberEmail);
+    return (
+      <div className="system-msg-row" style={{ display: "flex", justifyContent: "center", margin: "12px 0", width: "100%" }}>
+        <div className="system-msg-pill" style={{
+          background: "rgba(109, 175, 120, 0.12)",
+          border: "1px solid rgba(109, 175, 120, 0.28)",
+          color: "#275530",
+          fontSize: "12px",
+          fontWeight: 600,
+          padding: "6px 16px",
+          borderRadius: "20px",
+          display: "inline-flex",
+          alignItems: "center",
+          gap: "6px",
+          boxShadow: "0 2px 6px rgba(0,0,0,0.04)"
+        }}>
+          <span style={{ fontSize: "14px" }}>✨</span>
+          <span><strong>{adminLabel}</strong> added <strong>{memberLabel}</strong></span>
+        </div>
+      </div>
+    );
+  }
+
+  if (content.startsWith("[SYSTEM] member_left:")) {
+    const leftMemberEmail = content.replace("[SYSTEM] member_left:", "").trim();
+    const memberLabel = leftMemberEmail?.toLowerCase() === currentUser?.toLowerCase() ? "You" : getPeerName(leftMemberEmail);
+    return (
+      <div className="system-msg-row" style={{ display: "flex", justifyContent: "center", margin: "12px 0", width: "100%" }}>
+        <div className="system-msg-pill" style={{
+          background: "rgba(0, 0, 0, 0.05)",
+          border: "1px solid rgba(0, 0, 0, 0.08)",
+          color: "var(--text-3)",
+          fontSize: "12px",
+          fontWeight: 600,
+          padding: "6px 16px",
+          borderRadius: "20px",
+          display: "inline-flex",
+          alignItems: "center",
+          gap: "6px"
+        }}>
+          <span style={{ fontSize: "14px" }}>🚪</span>
+          <span><strong>{memberLabel}</strong> left the group</span>
+        </div>
+      </div>
+    );
+  }
   
   let mediaType: "image" | "video" | "audio" | "sticker" | "pdf" | "file" | "text" = "text";
   let rawUrl = "";
   let caption = "";
+  let encKey: string | undefined = undefined;
+  let encIv: string | undefined = undefined;
+  let encMime: string | undefined = undefined;
+  let encFileName: string | undefined = undefined;
 
-  if (content.startsWith("[IMAGE]")) {
+  const parseEncTag = (payload: string, type: "image" | "video" | "audio" | "pdf" | "file") => {
+    mediaType = type;
+    const lines = payload.split("\n");
+    const meta = lines[0].trim().split("|");
+    rawUrl = meta[0] || "";
+    encKey = meta[1] || undefined;
+    encIv = meta[2] || undefined;
+    encMime = meta[3] ? decodeURIComponent(meta[3]) : undefined;
+    encFileName = meta[4] ? decodeURIComponent(meta[4]) : undefined;
+    caption = lines.slice(1).join("\n").trim();
+  };
+
+  if (content.startsWith("[ENC_IMAGE]")) {
+    parseEncTag(content.slice(11), "image");
+  } else if (content.startsWith("[ENC_VIDEO]")) {
+    parseEncTag(content.slice(11), "video");
+  } else if (content.startsWith("[ENC_AUDIO]")) {
+    parseEncTag(content.slice(11), "audio");
+  } else if (content.startsWith("[ENC_PDF]")) {
+    parseEncTag(content.slice(9), "pdf");
+  } else if (content.startsWith("[ENC_FILE]")) {
+    parseEncTag(content.slice(10), "file");
+  } else if (content.startsWith("[IMAGE]")) {
     mediaType = "image";
     const rest = content.slice(7).trim();
     const parts = rest.split("\n");
@@ -197,18 +283,27 @@ const MessageBubble = memo(function MessageBubble({
   const isPdf = mediaType === "pdf";
   const isFile = mediaType === "file";
 
-  const cachedUrl = useCachedMedia(rawUrl);
-  const [mediaSrc, setMediaSrc] = useState(cachedUrl || rawUrl);
+  const cachedUrl = useCachedMedia(rawUrl, encKey, encIv, encMime);
+  const [mediaSrc, setMediaSrc] = useState(cachedUrl || (encKey ? "" : rawUrl));
 
   useEffect(() => {
-    setMediaSrc(cachedUrl || rawUrl);
-  }, [cachedUrl, rawUrl]);
+    setMediaSrc(cachedUrl || (encKey ? "" : rawUrl));
+  }, [cachedUrl, rawUrl, encKey]);
+
+  const isExpired = mediaSrc === "EXPIRED";
 
   const clearPress = () => {
     if (pressTimer.current) {
       clearTimeout(pressTimer.current);
       pressTimer.current = null;
     }
+  };
+
+  const openActionsAndReactions = () => {
+    touchHandledClick.current = true;
+    if (navigator.vibrate) navigator.vibrate(30);
+    onSelectMsg(item.id);
+    onSetReactionPicker(item.id);
   };
 
   const handleTouchStart = (e: React.TouchEvent) => {
@@ -221,14 +316,9 @@ const MessageBubble = memo(function MessageBubble({
     touchHandledClick.current = false;
     pressTimer.current = setTimeout(() => {
       if (!isSwipingRef.current) {
-        touchHandledClick.current = true;
-        if (navigator.vibrate) navigator.vibrate(30);
-        onSelectMsg(item.id);
-        if (!isSelectionModeActive) {
-          onSetReactionPicker(reactionPickerId === item.id ? null : item.id);
-        }
+        openActionsAndReactions();
       }
-    }, 450);
+    }, 320);
   };
 
   const handleTouchMove = (e: React.TouchEvent) => {
@@ -253,11 +343,7 @@ const MessageBubble = memo(function MessageBubble({
   const handleContextMenu = (e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    if (navigator.vibrate) navigator.vibrate(30);
-    onSelectMsg(item.id);
-    if (!isSelectionModeActive) {
-      onSetReactionPicker(reactionPickerId === item.id ? null : item.id);
-    }
+    openActionsAndReactions();
   };
 
   if (item._callRecord) {
@@ -285,9 +371,60 @@ const MessageBubble = memo(function MessageBubble({
 
   const myEmail = (currentUser || "").trim().toLowerCase();
 
+  if (item.is_deleted) {
+    const isDeletedByMe = Boolean(
+      (item.deleted_by && item.deleted_by.trim().toLowerCase() === myEmail) ||
+      (!item.deleted_by && isMine)
+    );
+    const deleterName = item.deleted_by_name || (item.deleted_by ? getPeerName(item.deleted_by) : getPeerName(item.user));
+    return (
+      <div
+        ref={bubbleRef}
+        id={`msg-${item.id}`}
+        className={`msg-row ${isMine ? "msg-mine msg-row--mine" : "msg-theirs msg-row--theirs"}`}
+      >
+        <div className="bw">
+          <div
+            className={`bubble ${isMine ? "mine msg-bubble--mine" : "theirs msg-bubble--theirs"} msg-bubble msg-deleted-tombstone`}
+            style={{
+              fontStyle: "italic",
+              opacity: 0.82,
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "7px",
+              padding: "8px 14px",
+              fontSize: "13px",
+              background: isMine ? "rgba(109, 175, 120, 0.22)" : "rgba(0, 0, 0, 0.06)",
+              color: isMine ? "inherit" : "var(--text-2, #666)",
+              borderRadius: "14px",
+              userSelect: "none",
+            }}
+          >
+            <span style={{ fontSize: "14px", opacity: 0.9 }}>🚫</span>
+            <span>
+              {isDeletedByMe ? "This message was deleted by you" : `This message was deleted by ${deleterName}`}
+            </span>
+            <span
+              className="msg-meta-time"
+              style={{
+                fontSize: "10px",
+                marginLeft: "6px",
+                opacity: 0.65,
+                fontWeight: 500,
+              }}
+            >
+              {formatTime(item.timestamp)}
+            </span>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div
       ref={bubbleRef}
+      id={`msg-${item.id}`}
       onContextMenu={handleContextMenu}
       onTouchStart={handleTouchStart}
       onTouchMove={handleTouchMove}
@@ -300,7 +437,7 @@ const MessageBubble = memo(function MessageBubble({
     >
       <div className={`bw ${isSelected ? "bw--selected" : ""}`}>
         {chatType === "group" && !isMine && (
-          <div className="sender-name msg-sender-name">
+          <div className="sender-name msg-sender-name" style={{ fontSize: "12px", fontWeight: 700, color: "#4a8b54", marginBottom: "4px", paddingLeft: "4px" }}>
             {getPeerName(item.user)}
           </div>
         )}
@@ -322,11 +459,50 @@ const MessageBubble = memo(function MessageBubble({
             </button>
           )}
 
-          {item.reply_to && (
-            <div className="msg-reply-preview">
-              <div className="msg-reply-sender">{getPeerName(item.reply_to.user)}</div>
+          {(item.reply_to || item.reply_to_content) && (
+            <div
+              className="msg-reply-preview"
+              style={{ cursor: "pointer" }}
+              onClick={(e) => {
+                e.stopPropagation();
+                const targetId = item.reply_to_id || item.reply_to?.id;
+                if (targetId) {
+                  if (onJumpToMessage) {
+                    onJumpToMessage(targetId);
+                  } else {
+                    const el = document.getElementById(`msg-${targetId}`);
+                    if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+                  }
+                }
+              }}
+            >
+              <div className="msg-reply-sender" style={{ fontWeight: 700, fontSize: "12px", color: isMine ? "rgba(255,255,255,0.95)" : "#4a8b54" }}>
+                {(() => {
+                  const replyUser = item.reply_to?.user || (item as any).reply_to_user || "";
+                  if (replyUser) {
+                    if (replyUser.toLowerCase() === (currentUser || "").toLowerCase()) {
+                      return "You";
+                    }
+                    return getPeerName(replyUser);
+                  }
+                  // Fallback if replyUser was omitted in payload:
+                  if (isMine) {
+                    return chatType === "user" ? getPeerName(item.target_user || (item.user !== currentUser ? item.user : "")) : "Replied message";
+                  }
+                  return "You";
+                })()}
+              </div>
               <div className="msg-reply-body">
-                {item.reply_to.content.startsWith("[") ? "📎 Attachment" : item.reply_to.content}
+                {(() => {
+                  const replyText = item.reply_to?.content || item.reply_to_content || "";
+                  if (replyText.startsWith("[STICKER]")) return "🎨 Sticker";
+                  if (replyText.startsWith("[AUDIO]") || replyText.startsWith("[ENC_AUDIO]") || replyText.startsWith("[VOICE]")) return "🎤 Voice Note";
+                  if (replyText.startsWith("[IMAGE]") || replyText.startsWith("[ENC_IMAGE]") || replyText.startsWith("[PHOTO]")) return "📷 Photo";
+                  if (replyText.startsWith("[VIDEO]") || replyText.startsWith("[ENC_VIDEO]")) return "📹 Video";
+                  if (replyText.startsWith("[PDF]") || replyText.startsWith("[ENC_PDF]") || replyText.startsWith("[FILE]") || replyText.startsWith("[ENC_FILE]")) return "📄 Document";
+                  if (replyText.startsWith("[")) return "📎 Attachment";
+                  return replyText;
+                })()}
               </div>
             </div>
           )}
@@ -348,17 +524,30 @@ const MessageBubble = memo(function MessageBubble({
             </div>
           ) : (
             <>
-              {isImage || isVideo ? (
+              {isExpired ? (
+                <div className="msg-media-expired" style={{ padding: "10px 14px", background: isMine ? "rgba(255,255,255,0.15)" : "rgba(0,0,0,0.06)", borderRadius: 12, display: "flex", alignItems: "center", gap: 10, fontSize: "0.85rem", color: isMine ? "#fff" : "var(--text-2)" }}>
+                  <span style={{ fontSize: "1.3rem" }}>⏳</span>
+                  <div>
+                    <div style={{ fontWeight: 600 }}>Media expired from server</div>
+                    <div style={{ fontSize: "0.75rem", opacity: 0.8 }}>Saved on sender/receiver original devices</div>
+                  </div>
+                </div>
+              ) : isImage || isVideo ? (
                 // ── IMAGE & VIDEO MEDIA BOX WITH OVERLAY META ──
-                <div className="msg-media-box" onClick={() => onViewFile(rawUrl || cachedUrl, isImage ? "image" : "video")}>
-                  {isImage ? (
+                <div className="msg-media-box" onClick={() => (mediaSrc && mediaSrc !== "EXPIRED") && onViewFile(mediaSrc, isImage ? "image" : "video")}>
+                  {encKey && !mediaSrc ? (
+                    <div style={{ width: 220, height: 160, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 8, background: "rgba(0,0,0,0.06)", borderRadius: 12 }}>
+                      <div style={{ width: 24, height: 24, border: "2.5px solid rgba(0,0,0,0.15)", borderTopColor: "var(--green, #25d366)", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+                      <span style={{ fontSize: "0.82rem", opacity: 0.8, color: "var(--text-1)" }}>Loading...</span>
+                    </div>
+                  ) : isImage ? (
                     <img
                       src={mediaSrc}
                       alt="attachment"
                       className="msg-img-media"
                       loading="lazy"
                       onError={() => {
-                        if (mediaSrc !== rawUrl && rawUrl) setMediaSrc(rawUrl);
+                        if (!encKey && mediaSrc !== rawUrl && rawUrl) setMediaSrc(rawUrl);
                       }}
                     />
                   ) : (
@@ -367,14 +556,25 @@ const MessageBubble = memo(function MessageBubble({
                         src={mediaSrc}
                         className="msg-video-media"
                         preload="metadata"
+                        muted
+                        playsInline
+                        onLoadedMetadata={(e) => {
+                          try {
+                            (e.target as HTMLVideoElement).currentTime = 0.1;
+                          } catch {}
+                        }}
                         onError={() => {
-                          if (mediaSrc !== rawUrl && rawUrl) setMediaSrc(rawUrl);
+                          if (!encKey && mediaSrc !== rawUrl && rawUrl) setMediaSrc(rawUrl);
                         }}
                       />
                       <div className="msg-video-play-btn">▶</div>
                     </div>
                   )}
-                  {caption && <div className="msg-media-caption">{caption}</div>}
+                  {caption && (
+                    <div className="msg-media-caption">
+                      <FormattedMessageText text={caption} />
+                    </div>
+                  )}
                   <div className="media-overlay-meta">
                     {item.is_edited && <span className="media-meta-edited">edited</span>}
                     <span className="media-meta-time">{formatTime(item.timestamp)}</span>
@@ -385,14 +585,21 @@ const MessageBubble = memo(function MessageBubble({
                 // ── AUDIO / VOICE NOTE ──
                 <>
                   <div className="msg-attachment-audio">
-                    <audio
-                      src={mediaSrc}
-                      controls
-                      className="msg-audio-media"
-                      onError={() => {
-                        if (mediaSrc !== rawUrl && rawUrl) setMediaSrc(rawUrl);
-                      }}
-                    />
+                    {encKey && !mediaSrc ? (
+                      <div style={{ padding: "10px 16px", display: "flex", alignItems: "center", gap: 8, fontSize: "0.85rem", opacity: 0.8, color: "var(--text-1)" }}>
+                        <div style={{ width: 16, height: 16, border: "2px solid rgba(0,0,0,0.15)", borderTopColor: "var(--green, #25d366)", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+                        <span>Loading audio...</span>
+                      </div>
+                    ) : (
+                      <audio
+                        src={mediaSrc}
+                        controls
+                        className="msg-audio-media"
+                        onError={() => {
+                          if (!encKey && mediaSrc !== rawUrl && rawUrl) setMediaSrc(rawUrl);
+                        }}
+                      />
+                    )}
                   </div>
                   <div className="msg-footer msg-meta">
                     {item.is_edited && <span className="msg-edited msg-meta-edited">edited</span>}
@@ -406,12 +613,16 @@ const MessageBubble = memo(function MessageBubble({
                   <div className="msg-file-card" onClick={() => onViewFile(rawUrl || cachedUrl, isPdf ? "pdf" : "file")}>
                     <div className="msg-file-icon">{isPdf ? "📄" : "📁"}</div>
                     <div className="msg-file-info">
-                      <span className="msg-file-name">{(rawUrl || cachedUrl).split("/").pop() || (isPdf ? "Document.pdf" : "Attachment")}</span>
+                      <span className="msg-file-name">{encFileName || (rawUrl || cachedUrl).split("/").pop() || (isPdf ? "Document.pdf" : "Attachment")}</span>
                       <span className="msg-file-sub">{isPdf ? "PDF Document" : "File Attachment"}</span>
                     </div>
                     <div className="msg-file-dl-btn">⬇</div>
                   </div>
-                  {caption && <div className="msg-file-caption" style={{ padding: "4px 8px", fontSize: "0.85rem" }}>{caption}</div>}
+                  {caption && (
+                    <div className="msg-file-caption" style={{ padding: "4px 8px", fontSize: "0.85rem" }}>
+                      <FormattedMessageText text={caption} />
+                    </div>
+                  )}
                   <div className="msg-footer msg-meta">
                     {item.is_edited && <span className="msg-edited msg-meta-edited">edited</span>}
                     <span className="msg-ts msg-meta-time">{formatTime(item.timestamp)}</span>
@@ -437,7 +648,9 @@ const MessageBubble = memo(function MessageBubble({
               ) : (
                 // ── REGULAR TEXT MESSAGE ──
                 <>
-                  <div className="msg-text msg-text-content">{item.content}</div>
+                  <div className="msg-text msg-text-content">
+                    <FormattedMessageText text={item.content} />
+                  </div>
                   <div className="msg-footer msg-meta">
                     {item.is_edited && <span className="msg-edited msg-meta-edited">edited</span>}
                     <span className="msg-ts msg-meta-time">{formatTime(item.timestamp)}</span>

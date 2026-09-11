@@ -201,25 +201,6 @@ export function useWebSocket(opts: UseWebSocketOptions) {
         useChatStore.getState().updateActivityTime(peerEmail, ts);
         useChatStore.getState().updateLastPreviewMsg(peerEmail, msg.content);
 
-        // Auto-add unknown contacts
-        const contacts = useContactStore.getState().contacts;
-        const contactExists = contacts.some((c) => c.email === peerEmail);
-        if (!contactExists) {
-          setContacts([
-            ...contacts,
-            {
-              email: peerEmail,
-              display_name: (data.sender_name as string) || null,
-              avatar_url: (data.sender_avatar as string) || null,
-              is_online: true,
-              username: null,
-            },
-          ]);
-          apiFetch("/contacts/by-email", { method: "POST", body: JSON.stringify({ email: peerEmail }) })
-            .then(() => optsRef.current.loadContactsFn())
-            .catch(() => {});
-        }
-
         const isInPeerChat = activeChat?.type === "user" && String(activeChat.id).toLowerCase() === peerEmail;
         if (isInPeerChat) {
           updateMsgCache(peerEmail, (prev) => {
@@ -410,17 +391,27 @@ export function useWebSocket(opts: UseWebSocketOptions) {
         break;
       }
 
-      case "message_deleted": {
+      case "message_deleted":
+      case "message_deleted_for_all": {
+        const delBy = (data as any).deleted_by;
+        const delByName = (data as any).deleted_by_name;
         const targetChatId = data.group_id
           ? String(data.group_id)
           : (activeChat ? String(activeChat.id).toLowerCase() : "");
 
         dbUpdateMessage(String(data.id), {
-          is_deleted: true
+          is_deleted: true,
+          deleted_by: delBy,
+          deleted_by_name: delByName,
+          content: "",
         }).catch(() => {});
 
         useChatStore.getState().setMessages((prev) =>
-          prev.map((m) => String(m.id) === String(data.id) ? { ...m, is_deleted: true } : m)
+          prev.map((m) =>
+            String(m.id) === String(data.id)
+              ? { ...m, is_deleted: true, deleted_by: delBy, deleted_by_name: delByName, content: "" }
+              : m
+          )
         );
         if (targetChatId && messagesCacheRef) {
           messagesCacheRef[targetChatId] = useChatStore.getState().messages;
@@ -440,6 +431,57 @@ export function useWebSocket(opts: UseWebSocketOptions) {
       case "group_updated":
         optsRef.current.loadGroupsFn();
         break;
+
+      // ── Contact Requests & Mutual Friends ──
+      case "contact_request_received": {
+        const req = data.request as any;
+        if (req) {
+          useContactStore.getState().addIncomingRequest(req);
+          optsRef.current.notifyFn(
+            `Contact Request from ${req.user?.display_name || req.user?.username || "Someone"}`,
+            req.note || "Sent you a contact request",
+            req.sender_email
+          );
+        }
+        break;
+      }
+
+      case "contact_request_accepted": {
+        const contact = data.contact as any;
+        if (contact) {
+          useContactStore.getState().addContact(contact);
+          optsRef.current.notifyFn(
+            "Contact Request Accepted",
+            `${contact.display_name || contact.username || "Someone"} accepted your request!`,
+            contact.email
+          );
+        }
+        break;
+      }
+
+      case "contact_added":
+        if ((data as any).contact) {
+          useContactStore.getState().addContact((data as any).contact);
+        }
+        break;
+
+      case "contact_request_declined":
+      case "contact_request_cancelled": {
+        const reqId = Number((data as any).request_id);
+        if (reqId) {
+          useContactStore.getState().removeIncomingRequest(reqId);
+          useContactStore.getState().removeOutgoingRequest(reqId);
+        }
+        break;
+      }
+
+      case "contact_removed": {
+        const cEmail = (data as any).contact_email;
+        if (cEmail) {
+          useContactStore.getState().removeContact(String(cEmail));
+        }
+        break;
+      }
 
       // ── Call signaling → delegated to parent ──
       case "call_offer":

@@ -28,9 +28,11 @@ export const parseTs = (ts: string): Date => {
   return isNaN(d.getTime()) ? (new Date(ts) || new Date()) : d;
 };
 
-export const formatTimeAgo = (ts: number): string => {
+export const formatTimeAgo = (ts: number | string): string => {
   if (!ts) return "";
-  const diff = Date.now() - ts;
+  const num = typeof ts === "string" ? parseTs(ts).getTime() : ts;
+  if (!num || isNaN(num)) return "";
+  const diff = Date.now() - num;
   const mins = Math.floor(diff / 60000);
   if (mins < 1) return "now";
   if (mins < 60) return `${mins}m`;

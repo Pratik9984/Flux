@@ -85,22 +85,48 @@ export function useWebRTC(opts: UseWebRTCOptions) {
         { urls: "stun:stun3.l.google.com:19302" },
         { urls: "stun:stun4.l.google.com:19302" },
         { urls: "stun:global.stun.twilio.com:3478" },
+        {
+          urls: [
+            "turn:flux-chat.duckdns.org:3478?transport=udp",
+            "turn:flux-chat.duckdns.org:3478?transport=tcp",
+          ],
+          username: "pulse_turn",
+          credential: "pulse_turn_secret_2026",
+        },
       ],
       iceCandidatePoolSize: 10,
     };
   }, []);
 
   const getMediaStream = useCallback(async (constraints: MediaStreamConstraints): Promise<MediaStream> => {
-    const md = navigator.mediaDevices;
-    if (!md?.getUserMedia) throw new Error("Camera/microphone not available.");
-    try { return await md.getUserMedia(constraints); }
-    catch (err: any) {
+    const md = typeof navigator !== "undefined" ? navigator.mediaDevices : undefined;
+    if (!md?.getUserMedia) {
+      const isNotSecure = typeof window !== "undefined" && window.isSecureContext === false;
+      throw new Error(
+        isNotSecure
+          ? "Microphone/Camera is blocked on insecure HTTP. Please use 'npm run dev:https' or open via localhost."
+          : "Camera and microphone are not available on this browser."
+      );
+    }
+    try {
+      return await md.getUserMedia(constraints);
+    } catch (err: any) {
       const name: string = err?.name || "";
-      if ((name === "OverconstrainedError" || name === "ConstraintNotSatisfiedError") && constraints.video && typeof constraints.video === "object")
-        return md.getUserMedia({ audio: constraints.audio, video: true });
-      if (name === "NotAllowedError" || name === "PermissionDeniedError") throw new Error("Permission denied. Please allow camera/microphone access.");
-      if (name === "NotFoundError" || name === "DevicesNotFoundError") throw new Error("No camera/microphone found.");
-      if (name === "NotReadableError" || name === "TrackStartError") throw new Error("Device already in use.");
+      if ((name === "OverconstrainedError" || name === "ConstraintNotSatisfiedError") && constraints.video && typeof constraints.video === "object") {
+        try { return await md.getUserMedia({ audio: constraints.audio, video: true }); } catch {}
+      }
+      if (name === "NotFoundError" || name === "DevicesNotFoundError") {
+        if (constraints.video) {
+          try { return await md.getUserMedia({ audio: constraints.audio || true, video: false }); } catch {}
+        }
+        throw new Error("No microphone or camera detected.");
+      }
+      if (name === "NotAllowedError" || name === "PermissionDeniedError") {
+        throw new Error("Permission denied. Please allow microphone and camera access in your browser site settings.");
+      }
+      if (name === "NotReadableError" || name === "TrackStartError") {
+        throw new Error("Camera or microphone is already in use by another application.");
+      }
       throw err;
     }
   }, []);
@@ -109,7 +135,9 @@ export function useWebRTC(opts: UseWebRTCOptions) {
   const setupWebRTC = useCallback(async (targetEmail: string) => {
     const localStream = localStreamRef.current;
     if (!localStream) throw new Error("Local media stream unavailable");
-    const pc = new RTCPeerConnection(rtcConfig);
+    const PeerConnection = (typeof window !== "undefined" && (window.RTCPeerConnection || (window as any).webkitRTCPeerConnection || (window as any).mozRTCPeerConnection)) || null;
+    if (!PeerConnection) throw new Error("WebRTC RTCPeerConnection is not supported in this environment");
+    const pc = new PeerConnection(rtcConfig);
     pcMapRef.current.set(targetEmail, pc);
     peerConnectionRef.current = pc;
     localStream.getTracks().forEach((track) => pc.addTrack(track, localStream));
@@ -287,7 +315,19 @@ export function useWebRTC(opts: UseWebRTCOptions) {
 
       if (!pendingRemoteDescriptionRef.current) {
         try {
-          const stored = sessionStorage.getItem("_Flux_call_offer");
+          let stored: string | null = null;
+          if (typeof window !== "undefined") {
+            try {
+              const nativeOffer = (window as any).FluxNativeBridge?.getPendingCallOffer?.();
+              if (nativeOffer && String(nativeOffer).trim().startsWith("{")) {
+                stored = String(nativeOffer);
+                (window as any).FluxNativeBridge?.clearPendingCallOffer?.();
+              }
+            } catch { }
+            if (!stored) {
+              stored = localStorage.getItem("flux_pending_call_offer") || sessionStorage.getItem("_Flux_call_offer");
+            }
+          }
           if (stored) {
             const parsed: StoredCallOffer = JSON.parse(stored);
             const sdpObj = (parsed.sdp && typeof parsed.sdp === "object") ? parsed.sdp as any : {};
@@ -296,19 +336,29 @@ export function useWebRTC(opts: UseWebRTCOptions) {
             const realSdp = sdpObj.sdp ? { type: sdpObj.type, sdp: sdpObj.sdp } : parsed.sdp;
             pendingRemoteDescriptionRef.current = realSdp;
             if (!callPeerRef.current && parsed.peer) {
-              callPeerRef.current = parsed.peer; callPeerNameRef.current = parsed.peerName;
+              callPeerRef.current = parsed.peer; callPeerNameRef.current = parsed.peerName || parsed.peer;
               isVideoCallRef.current = parsed.isVideo; callDirectionRef.current = "incoming";
               useCallStore.getState().setCallPeer(parsed.peer);
-              useCallStore.getState().setCallPeerName(parsed.peerName);
+              useCallStore.getState().setCallPeerName(parsed.peerName || parsed.peer);
               useCallStore.getState().setIsVideoCall(parsed.isVideo);
             }
           }
         } catch { /* ignore */ }
       }
-      try { sessionStorage.removeItem("_Flux_call_offer"); } catch { /* ignore */ }
+      try {
+        sessionStorage.removeItem("_Flux_call_offer");
+        localStorage.removeItem("flux_pending_call_offer");
+        if (typeof window !== "undefined") {
+          (window as any).FluxNativeBridge?.clearPendingCallOffer?.();
+        }
+      } catch { /* ignore */ }
 
       const targetPeer = callPeerRef.current || null;
-      if (!targetPeer || !pendingRemoteDescriptionRef.current) { endCall(false, "missed"); return; }
+      if (!targetPeer || !pendingRemoteDescriptionRef.current) {
+        if (targetPeer) optsRef.current.wsSend(JSON.stringify({ type: "call_reject", target_user: targetPeer }));
+        endCall(false, "missed");
+        return;
+      }
 
 
       localStreamRef.current = await getMediaStream({
@@ -557,6 +607,7 @@ export function useWebRTC(opts: UseWebRTCOptions) {
     const isMuted = useCallStore.getState().isMuted;
     if (!isVideoCall || !localStreamRef.current) return;
     const newMode = facingMode === "user" ? "environment" : "user";
+    if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) return;
     try {
       localStreamRef.current.getTracks().forEach((t) => t.stop());
       let ns: MediaStream;
@@ -588,31 +639,60 @@ export function useWebRTC(opts: UseWebRTCOptions) {
     }
   }, []);
 
-  const restoreCallOfferFromStorage = useCallback(() => {
+  const restoreCallOfferFromStorage = useCallback((forceAction?: string) => {
     try {
-      const stored = sessionStorage.getItem("_Flux_call_offer");
+      let stored: string | null = null;
+      let action = forceAction || "";
+      if (typeof window !== "undefined") {
+        try {
+          const nativeBridgeOffer = (window as any).FluxNativeBridge?.getPendingCallOffer?.();
+          if (nativeBridgeOffer && String(nativeBridgeOffer).trim().startsWith("{")) {
+            stored = String(nativeBridgeOffer);
+            (window as any).FluxNativeBridge?.clearPendingCallOffer?.();
+          }
+        } catch { }
+        if (!stored) {
+          stored = localStorage.getItem("flux_pending_call_offer") || sessionStorage.getItem("_Flux_call_offer");
+        }
+      }
       if (!stored) return false;
-      const parsed: StoredCallOffer = JSON.parse(stored);
-      if (Date.now() - parsed.ts > 55_000) { sessionStorage.removeItem("_Flux_call_offer"); return false; }
-      if (callStateRef.current !== "idle") return false;
+      const parsed: StoredCallOffer & { action?: string } = JSON.parse(stored);
+      if (Date.now() - (parsed.ts || 0) > 60_000) {
+        try {
+          sessionStorage.removeItem("_Flux_call_offer");
+          localStorage.removeItem("flux_pending_call_offer");
+        } catch { }
+        return false;
+      }
+      if (!action && parsed.action) action = parsed.action;
+      if (callStateRef.current !== "idle" && action !== "accept") return false;
+
       const sdpObj = (parsed.sdp && typeof parsed.sdp === "object") ? parsed.sdp as any : {};
       const offerGroupId = parsed.group_id || sdpObj.group_id;
       if (offerGroupId) callGroupIdRef.current = offerGroupId;
       const realSdp = sdpObj.sdp ? { type: sdpObj.type, sdp: sdpObj.sdp } : parsed.sdp;
       pendingRemoteDescriptionRef.current = realSdp;
       useCallStore.getState().setCallPeer(parsed.peer);
-      useCallStore.getState().setCallPeerName(parsed.peerName);
+      useCallStore.getState().setCallPeerName(parsed.peerName || parsed.peer);
       useCallStore.getState().setIsVideoCall(parsed.isVideo);
       isVideoCallRef.current = parsed.isVideo;
       callDirectionRef.current = "incoming";
       callPeerRef.current = parsed.peer;
-      callPeerNameRef.current = parsed.peerName;
-      updateCallState("incoming");
-      optsRef.current.startRingtone();
-      optsRef.current.notifyCall(parsed.isVideo ? "📹 Incoming Video Call" : "📞 Incoming Voice Call", `${parsed.peerName} is calling…`);
+      callPeerNameRef.current = parsed.peerName || parsed.peer;
+
+      if (action === "accept") {
+        updateCallState("incoming");
+        setTimeout(() => {
+          acceptCall();
+        }, 120);
+      } else {
+        updateCallState("incoming");
+        optsRef.current.startRingtone();
+        optsRef.current.notifyCall(parsed.isVideo ? "📹 Incoming Video Call" : "📞 Incoming Voice Call", `${parsed.peerName || parsed.peer} is calling…`);
+      }
       return true;
     } catch { return false; }
-  }, [updateCallState]);
+  }, [updateCallState, acceptCall]);
 
   // ── PiP drag ──
   const onPipMouseDown = useCallback((e: React.MouseEvent) => {

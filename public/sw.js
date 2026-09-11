@@ -3,9 +3,7 @@ const STATIC_ASSETS = [
   '/',
   '/icon.png',
   '/notification.mp3',
-  '/ringtone.mp3',
-  '/ringtone2.mp3',
-  '/ringtone3.mp3'
+  '/ringtone.mp3'
 ];
 
 // Install Event - Pre-cache essential static shell assets

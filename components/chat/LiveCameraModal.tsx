@@ -28,11 +28,24 @@ export default function LiveCameraModal({ isOpen, onClose, onCapture }: LiveCame
     }
   }, []);
 
+  const fallbackInputRef = useRef<HTMLInputElement | null>(null);
+
   // Start camera stream
   const startCamera = useCallback(async (mode: "environment" | "user") => {
     stopStream();
     setError(null);
     setIsInitializing(true);
+
+    if (typeof navigator === "undefined" || !navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== "function") {
+      const isNotSecure = typeof window !== "undefined" && window.isSecureContext === false;
+      const msg = isNotSecure
+        ? "In-app camera streaming requires HTTPS or localhost (Secure Context). When connecting over local IP, use localhost or the System Camera button below."
+        : "In-app camera is not supported in this browser.";
+      console.warn(msg);
+      setError(msg);
+      setIsInitializing(false);
+      return;
+    }
 
     try {
       const constraints: MediaStreamConstraints = {
@@ -60,20 +73,26 @@ export default function LiveCameraModal({ isOpen, onClose, onCapture }: LiveCame
         setHasMultipleCameras(videoDevices.length > 1);
       }
     } catch (err: any) {
-      console.warn("Failed to start in-app camera:", err);
-      // Fallback with loose constraints
-      try {
-        const fallbackStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-        streamRef.current = fallbackStream;
-        if (videoRef.current) {
-          videoRef.current.srcObject = fallbackStream;
-          await videoRef.current.play().catch(() => {});
+      console.warn("Failed to start in-app camera with ideal constraints:", err);
+      // Fallback with loose constraints if mediaDevices is available
+      if (navigator?.mediaDevices?.getUserMedia) {
+        try {
+          const fallbackStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+          streamRef.current = fallbackStream;
+          if (videoRef.current) {
+            videoRef.current.srcObject = fallbackStream;
+            await videoRef.current.play().catch(() => {});
+          }
+          setIsInitializing(false);
+          return;
+        } catch (fallbackErr: any) {
+          setError(fallbackErr?.message || "Camera access denied or unavailable");
+          setIsInitializing(false);
+          return;
         }
-        setIsInitializing(false);
-      } catch (fallbackErr: any) {
-        setError(fallbackErr?.message || "Camera access denied or unavailable");
-        setIsInitializing(false);
       }
+      setError(err?.message || "Camera access denied or unavailable");
+      setIsInitializing(false);
     }
   }, [stopStream]);
 
@@ -87,6 +106,16 @@ export default function LiveCameraModal({ isOpen, onClose, onCapture }: LiveCame
       stopStream();
     };
   }, [isOpen, facingMode, startCamera, stopStream]);
+
+  // Handle fallback native file capture
+  const handleFallbackFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const previewUrl = URL.createObjectURL(file);
+    stopStream();
+    onCapture(file, previewUrl);
+    e.target.value = "";
+  };
 
   // Flip between front & back camera
   const handleFlipCamera = () => {
@@ -222,25 +251,79 @@ export default function LiveCameraModal({ isOpen, onClose, onCapture }: LiveCame
         }}
       >
         {error ? (
-          <div style={{ color: "#ef4444", textAlign: "center", padding: 24, maxWidth: 320 }}>
-            <p style={{ fontSize: 16, fontWeight: 600, marginBottom: 8 }}>Camera Error</p>
-            <p style={{ fontSize: 13, color: "rgba(255,255,255,0.7)" }}>{error}</p>
-            <button
-              onClick={() => startCamera(facingMode)}
-              style={{
-                marginTop: 16,
-                padding: "8px 18px",
-                borderRadius: 8,
-                background: "var(--primary, #22c55e)",
-                color: "#fff",
-                border: "none",
-                fontSize: 14,
-                fontWeight: 600,
-                cursor: "pointer",
-              }}
-            >
-              Retry
-            </button>
+          <div style={{ color: "#ef4444", textAlign: "center", padding: 24, maxWidth: 360 }}>
+            <div style={{ fontSize: 36, marginBottom: 12 }}>📷</div>
+            <p style={{ fontSize: 16, fontWeight: 600, marginBottom: 8, color: "#fff" }}>Camera Unavailable</p>
+            <p style={{ fontSize: 13, color: "rgba(255,255,255,0.7)", lineHeight: 1.5 }}>{error}</p>
+            
+            <input
+              ref={fallbackInputRef}
+              type="file"
+              accept="image/*"
+              capture="environment"
+              style={{ display: "none" }}
+              onChange={handleFallbackFile}
+            />
+
+            <div style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 20 }}>
+              <button
+                onClick={() => fallbackInputRef.current?.click()}
+                type="button"
+                style={{
+                  padding: "10px 18px",
+                  borderRadius: 10,
+                  background: "#25d366",
+                  color: "#000",
+                  border: "none",
+                  fontSize: 14,
+                  fontWeight: 600,
+                  cursor: "pointer",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: 8,
+                }}
+              >
+                <span>📸</span> Use System Camera / File
+              </button>
+
+              <div style={{ display: "flex", gap: 8, justifyContent: "center" }}>
+                <button
+                  onClick={() => startCamera(facingMode)}
+                  type="button"
+                  style={{
+                    flex: 1,
+                    padding: "8px 16px",
+                    borderRadius: 8,
+                    background: "rgba(255,255,255,0.15)",
+                    color: "#fff",
+                    border: "1px solid rgba(255,255,255,0.2)",
+                    fontSize: 13,
+                    fontWeight: 500,
+                    cursor: "pointer",
+                  }}
+                >
+                  Retry
+                </button>
+                <button
+                  onClick={onClose}
+                  type="button"
+                  style={{
+                    flex: 1,
+                    padding: "8px 16px",
+                    borderRadius: 8,
+                    background: "rgba(255,255,255,0.1)",
+                    color: "rgba(255,255,255,0.7)",
+                    border: "1px solid rgba(255,255,255,0.1)",
+                    fontSize: 13,
+                    fontWeight: 500,
+                    cursor: "pointer",
+                  }}
+                >
+                  Close
+                </button>
+              </div>
+            </div>
           </div>
         ) : (
           <video

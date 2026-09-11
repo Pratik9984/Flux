@@ -42,7 +42,7 @@ export function useAuth(crypto: CryptoHook) {
   const storeLogout = useAuthStore((s) => s.logout);
 
   const [auth, dispatchAuth] = useReducer(authReducer, {
-    step: "signin" as const,
+    step: "welcome" as const,
     email: "", pass: "", pass2: "", user: "", loading: false, error: "",
   });
 
@@ -50,14 +50,7 @@ export function useAuth(crypto: CryptoHook) {
 
   const _registerFCMToken = useCallback(async (authToken: string) => {
     try {
-      const permission = await requestFCMPermission();
-      if (!permission) return;
-      const { getToken: getFCMToken } = await import("firebase/messaging");
-      const { messaging } = await import("@/lib/firebase");
-      if (!messaging) return;
-      const fcmToken = await getFCMToken(messaging, {
-        vapidKey: process.env.NEXT_PUBLIC_FIREBASE_VAPID_KEY || "",
-      });
+      const fcmToken = await requestFCMPermission();
       if (fcmToken) {
         await fetch(`${API}/profile/fcm-token`, {
           method: "POST",
@@ -68,10 +61,18 @@ export function useAuth(crypto: CryptoHook) {
     } catch { /* FCM optional */ }
   }, []);
 
-  const _finalizeAuth = useCallback(async (backendToken: string, email: string) => {
+  const _finalizeAuth = useCallback(async (backendToken: string, email: string, userObj?: any) => {
     const lowerEmail = email.toLowerCase();
     setToken(backendToken);
     setCurrentUser(lowerEmail);
+    if (userObj) {
+      const uname = userObj.username || lowerEmail.split("@")[0];
+      setProfile({
+        displayName: userObj.display_name || "",
+        avatarUrl: userObj.avatar_url || "",
+        username: uname,
+      });
+    }
     pendingSupabaseToken.current = "";
     
     requestNotifyPermission();
@@ -79,7 +80,7 @@ export function useAuth(crypto: CryptoHook) {
 
     // Init E2E keys
     await crypto.initializeKeys(lowerEmail);
-  }, [setToken, setCurrentUser, crypto, _registerFCMToken]);
+  }, [setToken, setCurrentUser, setProfile, crypto, _registerFCMToken]);
 
   const handleSignIn = useCallback(async () => {
     dispatchAuth({ type: "SET_ERROR", value: "" });
@@ -97,7 +98,7 @@ export function useAuth(crypto: CryptoHook) {
       const res = await apiFetch<{ access_token: string; user: any }>("/auth/login", {
         method: "POST", body: JSON.stringify({ id_token: idToken }),
       });
-      await _finalizeAuth(res.access_token, res.user.email);
+      await _finalizeAuth(res.access_token, res.user?.email || auth.email.trim(), res.user);
       dispatchAuth({ type: "RESET" });
     } catch (e: any) {
       if (e.message?.includes("Account not found")) {
@@ -166,14 +167,14 @@ export function useAuth(crypto: CryptoHook) {
           display_name: auth.user.trim(),
         }),
       });
-      await _finalizeAuth(res.access_token, res.user.email);
+      await _finalizeAuth(res.access_token, res.user?.email || auth.email.trim(), res.user);
       dispatchAuth({ type: "RESET" });
     } catch (e: any) {
       dispatchAuth({ type: "SET_ERROR", value: errorMessage(e) });
     } finally {
       dispatchAuth({ type: "SET_LOADING", value: false });
     }
-  }, [auth.user, apiFetch, _finalizeAuth]);
+  }, [auth.user, auth.email, apiFetch, _finalizeAuth]);
 
   const handleForgotPassword = useCallback(async () => {
     if (!auth.email.trim()) return dispatchAuth({ type: "SET_ERROR", value: "Enter your email first" });

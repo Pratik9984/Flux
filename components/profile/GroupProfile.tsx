@@ -8,6 +8,7 @@ import { useContactStore } from "@/stores/contactStore";
 import { useChatStore } from "@/stores/chatStore";
 import { useCallStore } from "@/stores/callStore";
 import { useUiStore } from "@/stores/uiStore";
+import { AvatarImage } from "@/components/ui/AvatarImage";
 
 export interface GroupProfileProps {
   group: Group | undefined;
@@ -23,6 +24,7 @@ export interface GroupProfileProps {
   apiFetch: <T>(path: string, opts?: any) => Promise<T>;
   loadGroups: () => Promise<void>;
   onCallFromLog?: (log: CallLogEntry, video: boolean) => void;
+  onAddContact?: (email: string) => void;
 }
 
 export default function GroupProfile({
@@ -39,6 +41,7 @@ export default function GroupProfile({
   apiFetch,
   loadGroups,
   onCallFromLog,
+  onAddContact,
 }: GroupProfileProps) {
   const currentUser = useAuthStore((s) => s.currentUser);
   const profile = useAuthStore((s) => s.profile);
@@ -52,10 +55,31 @@ export default function GroupProfile({
 
   const [newMemberInput, setNewMemberInput] = useState("");
   const [tab, setTab] = useState<ProfileTab>("members");
+  const [isEditingDesc, setIsEditingDesc] = useState(false);
+  const [descInput, setDescInput] = useState(g?.description || "");
+  const [savingDesc, setSavingDesc] = useState(false);
   const [memberProfiles, setMemberProfiles] = useState<Record<string, {
     display_name?: string | null; username?: string | null; avatar_url?: string | null;
   }>>({});
   const [openMenuEmail, setOpenMenuEmail] = useState<string | null>(null);
+
+  const handleSaveDescription = async () => {
+    if (!g) return;
+    setSavingDesc(true);
+    try {
+      await apiFetch(`/groups/${g.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ description: descInput.trim() }),
+      });
+      showToast("Group description updated", "success");
+      await loadGroups();
+      setIsEditingDesc(false);
+    } catch (err: any) {
+      showToast("Failed to update description: " + (err.message || err), "error");
+    } finally {
+      setSavingDesc(false);
+    }
+  };
 
   const contactLabel = (c: any) =>
     nicknames[c.email] || c.display_name || (c.username ? `@${c.username}` : null) || "Unknown User";
@@ -166,7 +190,7 @@ export default function GroupProfile({
       <div className="pfs-cover">
         <div className="pfs-cover-img" /><div className="pfs-cover-bg" />
         <div className="pfs-avatar" style={{ borderRadius: "24%" }} onClick={() => { if (g.avatar_url) onViewFile(g.avatar_url, "avatar-circle"); }}>
-          {g.avatar_url ? <img src={g.avatar_url} alt="Group Avatar" className="img-cover" /> : g.name?.[0]?.toUpperCase() || "?"}
+          {g.avatar_url ? <AvatarImage src={g.avatar_url} alt="Group Avatar" className="img-cover" fallbackText={g.name} /> : g.name?.[0]?.toUpperCase() || "?"}
           {isAdmin && (
             <button
               onClick={e => { e.stopPropagation(); groupAvatarInputRef.current?.click(); }}
@@ -206,6 +230,57 @@ export default function GroupProfile({
         </button>
       </div>
 
+      {/* Group Description Card */}
+      <div className="pfs-group-desc-card" style={{ margin: "14px 16px 8px", padding: "14px 16px", background: "#ffffff", borderRadius: "16px", border: "1px solid rgba(0,0,0,0.06)", boxShadow: "0 1px 3px rgba(0,0,0,0.02)" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+          <span style={{ fontSize: "11px", fontWeight: 700, color: "#6daf78", textTransform: "uppercase", letterSpacing: "0.06em" }}>Group Description</span>
+          {isAdmin && !isEditingDesc && (
+            <button
+              onClick={() => { setDescInput(g?.description || ""); setIsEditingDesc(true); }}
+              style={{ background: "none", border: "none", color: "#6daf78", cursor: "pointer", fontSize: "12.5px", fontWeight: 600, padding: 0 }}
+            >
+              {g?.description ? "Edit" : "Add description"}
+            </button>
+          )}
+        </div>
+        {isEditingDesc ? (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            <textarea
+              value={descInput}
+              onChange={e => setDescInput(e.target.value)}
+              placeholder="Add a group description..."
+              rows={3}
+              maxLength={500}
+              style={{ width: "100%", padding: "10px 12px", borderRadius: "12px", border: "1px solid rgba(109,175,120,0.4)", outline: "none", fontSize: "13.5px", resize: "none", background: "#f9fafb", color: "#181c1f", fontFamily: "inherit" }}
+              autoFocus
+            />
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+              <button
+                onClick={() => setIsEditingDesc(false)}
+                disabled={savingDesc}
+                style={{ padding: "6px 14px", borderRadius: "10px", border: "none", background: "#f4f5f7", color: "#555", fontSize: "12.5px", fontWeight: 600, cursor: "pointer" }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleSaveDescription}
+                disabled={savingDesc}
+                style={{ padding: "6px 16px", borderRadius: "10px", border: "none", background: "#6daf78", color: "#ffffff", fontSize: "12.5px", fontWeight: 700, cursor: "pointer" }}
+              >
+                {savingDesc ? "Saving..." : "Save"}
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div
+            onClick={() => { if (isAdmin) { setDescInput(g?.description || ""); setIsEditingDesc(true); } }}
+            style={{ fontSize: "13.5px", color: g?.description ? "#181c1f" : "#8a9096", whiteSpace: "pre-wrap", lineHeight: 1.45, cursor: isAdmin ? "pointer" : "default" }}
+          >
+            {g?.description || (isAdmin ? "Tap to add a description for this group..." : "No description provided")}
+          </div>
+        )}
+      </div>
+
       <div className="pfs-tabs">
         {(["members", "media", "calls"] as ProfileTab[]).map(t => (
           <button key={t} className={`pfs-tab ${tab === t ? "active" : ""}`} onClick={() => setTab(t)}>
@@ -226,12 +301,12 @@ export default function GroupProfile({
                   onChange={e => setNewMemberInput(e.target.value)}
                   onKeyDown={e => { if (e.key === "Enter" && newMemberInput.trim()) { onAddMember(newMemberInput); setNewMemberInput(""); } }}
                   className="add-member-field"
-                  style={{ flex: 1, padding: "8px 12px", background: "var(--surface-3)", border: "1px solid var(--border)", borderRadius: 8, color: "#fff" }}
+                  style={{ flex: 1, padding: "10px 14px", background: "#f4f5f7", border: "1px solid rgba(0,0,0,0.06)", borderRadius: 12, color: "#181c1f", fontSize: "14px", outline: "none" }}
                 />
                 <button
                   onClick={() => { if (newMemberInput.trim()) { onAddMember(newMemberInput); setNewMemberInput(""); } }}
                   className="add-member-btn"
-                  style={{ background: "var(--primary)", color: "#fff", padding: "8px 16px", borderRadius: 8, border: "none", fontWeight: "bold" }}
+                  style={{ background: "#6daf78", color: "#ffffff", padding: "10px 18px", borderRadius: 12, border: "none", fontWeight: 700, cursor: "pointer" }}
                 >
                   Add
                 </button>
@@ -248,46 +323,67 @@ export default function GroupProfile({
                 const showMenu = openMenuEmail === email;
 
                 return (
-                  <div key={idx} className="pfs-member-item" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", position: "relative" }}>
+                  <div key={idx} className="pfs-member-item" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", position: "relative", padding: "12px 14px", background: "#ffffff", borderRadius: 14, border: "1px solid rgba(0,0,0,0.05)", marginBottom: 8 }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-                      <div className="pfs-member-av">{av ? <img src={av} alt="avatar" className="img-cover rounded-circle" /> : name[0]?.toUpperCase() || "?"}</div>
+                      <div className="pfs-member-av">{av ? <AvatarImage src={av} alt="avatar" className="img-cover rounded-circle" fallbackText={name} /> : name[0]?.toUpperCase() || "?"}</div>
                       <div>
-                        <div className="pfs-member-name">{name} {isMe && "(You)"}</div>
-                        <div className="pfs-member-sub">{sub}</div>
+                        <div className="pfs-member-name" style={{ color: "#181c1f", fontWeight: 700 }}>{name} {isMe && "(You)"}</div>
+                        <div className="pfs-member-sub" style={{ color: "#8a9096", fontSize: "12px" }}>{sub}</div>
                       </div>
                     </div>
                     <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                      {isMemberAdmin && <span className="admin-pill" style={{ background: "rgba(37,211,102,0.15)", color: "#4fe081", padding: "2px 8px", borderRadius: 10, fontSize: 10, fontWeight: "bold" }}>Admin</span>}
+                      {!isMe && !contacts.some(c => c.email.toLowerCase() === email.toLowerCase()) && (
+                        <button
+                          type="button"
+                          onClick={() => onAddContact && onAddContact(email)}
+                          style={{
+                            padding: "4px 10px",
+                            borderRadius: 10,
+                            border: "1px solid rgba(109, 175, 120, 0.4)",
+                            background: "rgba(109, 175, 120, 0.1)",
+                            color: "#4e9158",
+                            fontSize: 12,
+                            fontWeight: 700,
+                            cursor: "pointer",
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 4,
+                          }}
+                        >
+                          + Add
+                        </button>
+                      )}
+                      {isMemberAdmin && <span className="admin-pill" style={{ background: "#ebf5ee", color: "#2e7d32", border: "1px solid rgba(46,125,50,0.2)", padding: "3px 10px", borderRadius: 10, fontSize: 11, fontWeight: 700 }}>Admin</span>}
                       {isAdmin && !isMe && (
                         <div style={{ position: "relative" }}>
                           <button
                             onClick={e => { e.stopPropagation(); setOpenMenuEmail(showMenu ? null : email); }}
                             className="tool-btn"
-                            style={{ width: 28, height: 28, borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center", border: "none" }}
+                            style={{ width: 28, height: 28, borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center", border: "none", background: "#f4f5f7", color: "#181c1f", cursor: "pointer" }}
                             title="Manage member"
                             aria-label="Manage member"
                           >
                             ⋮
                           </button>
                           {showMenu && (
-                            <div className="member-dropdown-menu" style={{ position: "absolute", right: 0, top: 32, background: "var(--surface-3)", border: "1px solid var(--border)", borderRadius: 8, zIndex: 100, width: 140, boxShadow: "0 4px 12px rgba(0,0,0,0.5)" }}>
+                            <div className="member-dropdown-menu" style={{ position: "absolute", right: 0, top: 32, background: "#ffffff", border: "1px solid rgba(0,0,0,0.08)", borderRadius: 12, zIndex: 100, width: 160, boxShadow: "0 8px 24px rgba(0,0,0,0.12)", padding: "4px" }}>
                               <button
                                 onClick={() => handleKickMember(email)}
-                                style={{ width: "100%", padding: "8px 12px", background: "none", border: "none", color: "var(--danger)", textAlign: "left", cursor: "pointer", fontSize: "0.85rem" }}
+                                style={{ width: "100%", padding: "10px 12px", background: "none", border: "none", color: "#d32f2f", textAlign: "left", cursor: "pointer", fontSize: "0.85rem", fontWeight: 600, borderRadius: 8 }}
                               >
                                 Kick Member
                               </button>
                               {isMemberAdmin ? (
                                 <button
                                   onClick={() => handleDemoteAdmin(email)}
-                                  style={{ width: "100%", padding: "8px 12px", background: "none", border: "none", color: "#fff", textAlign: "left", cursor: "pointer", fontSize: "0.85rem" }}
+                                  style={{ width: "100%", padding: "10px 12px", background: "none", border: "none", color: "#181c1f", textAlign: "left", cursor: "pointer", fontSize: "0.85rem", fontWeight: 600, borderRadius: 8 }}
                                 >
                                   Demote from Admin
                                 </button>
                               ) : (
                                 <button
                                   onClick={() => handlePromoteAdmin(email)}
-                                  style={{ width: "100%", padding: "8px 12px", background: "none", border: "none", color: "#fff", textAlign: "left", cursor: "pointer", fontSize: "0.85rem" }}
+                                  style={{ width: "100%", padding: "10px 12px", background: "none", border: "none", color: "#181c1f", textAlign: "left", cursor: "pointer", fontSize: "0.85rem", fontWeight: 600, borderRadius: 8 }}
                                 >
                                   Make Admin
                                 </button>

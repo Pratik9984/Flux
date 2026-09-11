@@ -30,12 +30,19 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 
-# env files (can opt-in for committing if needed)
-.env*
+# env files (allow .env.local and .env.example for web deployment)
+.env*.local
+!.env.local
+!.env.example
 
-# vercel
+# vercel & web hosting
 .vercel
 
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Android native build outputs
+/android/
+*.apk
+Flux.apk

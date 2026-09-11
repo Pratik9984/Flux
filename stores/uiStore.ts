@@ -14,7 +14,7 @@ export interface UiState {
   showEmojis: boolean;
   showStickers: boolean;
   emojiPanelTab: "emojis" | "stickers";
-  viewFile: { url: string; type: string } | null;
+  viewFile: { url: string; type: string; isSelf?: boolean } | null;
   searchQuery: string;
   wsStatus: WsStatus;
   showNewContact: boolean;
@@ -45,7 +45,7 @@ export interface UiState {
   setShowEmojis: (val: boolean) => void;
   setShowStickers: (val: boolean) => void;
   setEmojiPanelTab: (tab: "emojis" | "stickers") => void;
-  setViewFile: (file: { url: string; type: string } | null) => void;
+  setViewFile: (file: { url: string; type: string; isSelf?: boolean } | null) => void;
   setSearchQuery: (query: string) => void;
   setWsStatus: (status: WsStatus) => void;
   setShowNewContact: (val: boolean) => void;

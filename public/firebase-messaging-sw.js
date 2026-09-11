@@ -20,12 +20,27 @@ messaging.onBackgroundMessage((payload) => {
     }
 
     const data = payload.data || {};
-    const isCall = data.type === 'call';
+    const isCall = data.type === 'call' || data.type === 'call_offer';
+
+    let body = payload.notification?.body || '';
+    if (body.startsWith('[ENC_IMAGE]') || body.startsWith('[IMAGE]')) body = '📷 Photo';
+    else if (body.startsWith('[ENC_VIDEO]') || body.startsWith('[VIDEO]')) body = '🎥 Video';
+    else if (body.startsWith('[ENC_AUDIO]') || body.startsWith('[AUDIO]')) body = '🎤 Voice message';
+    else if (body.startsWith('[ENC_PDF]') || body.startsWith('[PDF]')) body = '📄 Document (PDF)';
+    else if (body.startsWith('[ENC_FILE]') || body.startsWith('[FILE]')) body = '📎 Document';
+    else if (body.includes('/files/')) {
+        const lower = body.toLowerCase();
+        if (lower.includes('.jpg') || lower.includes('.png') || lower.includes('.jpeg') || lower.includes('.webp')) body = '📷 Photo';
+        else if (lower.includes('.mp4') || lower.includes('.webm') || lower.includes('.mov') || lower.includes('.3gp')) body = '🎥 Video';
+        else if (lower.includes('.mp3') || lower.includes('.ogg') || lower.includes('.wav') || lower.includes('.m4a')) body = '🎤 Voice message';
+        else if (lower.includes('.pdf')) body = '📄 Document (PDF)';
+        else body = '📎 Document';
+    }
 
     self.registration.showNotification(
-        payload.notification?.title || 'Flux',
+        payload.notification?.title || 'Pulse',
         {
-            body: payload.notification?.body || '',
+            body: body,
             icon: '/favicon.ico',
             tag: isCall ? 'incoming-call' : 'message-' + Date.now(),
             renotify: true,

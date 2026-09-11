@@ -11,7 +11,7 @@ export interface DBCachedFile {
 }
 
 const DB_NAME = "FluxLocalDB";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 let dbInstance: IDBDatabase | null = null;
 
@@ -49,6 +49,11 @@ export function initDB(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains("cached_files")) {
         db.createObjectStore("cached_files", { keyPath: "url" });
       }
+
+      // 4. cached_media_blobs store (persistent decrypted chat media)
+      if (!db.objectStoreNames.contains("cached_media_blobs")) {
+        db.createObjectStore("cached_media_blobs", { keyPath: "url" });
+      }
     };
 
     request.onsuccess = () => {
@@ -69,11 +74,28 @@ export function initDB(): Promise<IDBDatabase> {
  */
 export function resolveMessageChatId(msg: any, fallbackChatId?: string): string {
   if (fallbackChatId) return String(fallbackChatId).toLowerCase();
-  if (msg.chatId) return String(msg.chatId).toLowerCase();
   if (msg.group_id) return String(msg.group_id);
-  const target = (msg.target_user || msg.receiver_email || "").toLowerCase();
-  const sender = (msg.user || msg.sender_email || "").toLowerCase();
-  return target || sender || "unknown";
+  
+  const myEmail = (
+    typeof window !== "undefined"
+      ? (localStorage.getItem("chat_user") || "").toLowerCase().trim()
+      : ""
+  );
+
+  const sender = (msg.user || msg.sender_email || "").toLowerCase().trim();
+  const receiver = (msg.receiver_email || msg.target_user || "").toLowerCase().trim();
+
+  // For 1-on-1 direct messages, the chatId is the peer's email (the other participant)
+  if (sender && receiver) {
+    if (myEmail) {
+      if (sender === myEmail) return receiver;
+      if (receiver === myEmail) return sender;
+    }
+    return sender === myEmail ? receiver : sender;
+  }
+
+  if (msg.chatId && !msg.chatId.includes("@")) return String(msg.chatId);
+  return (receiver || sender || msg.chatId || "unknown").toLowerCase();
 }
 
 /**
@@ -130,6 +152,44 @@ export async function dbSaveMessages(msgs: Message[], chatIdOverride?: string): 
     });
   } catch (err) {
     console.error("dbSaveMessages failed:", err);
+  }
+}
+
+/**
+ * Preload all recent conversation messages into memory for 0ms instant display.
+ */
+export async function dbPreloadRecentMessages(): Promise<Record<string, Message[]>> {
+  try {
+    const db = await initDB();
+    return new Promise((resolve) => {
+      const transaction = db.transaction("messages", "readonly");
+      const store = transaction.objectStore("messages");
+      const request = store.getAll();
+
+      request.onsuccess = () => {
+        const allMsgs = request.result as (Message & { chatId: string })[];
+        const byChat: Record<string, Message[]> = {};
+        if (allMsgs && allMsgs.length > 0) {
+          for (const m of allMsgs) {
+            const cId = m.chatId || resolveMessageChatId(m);
+            if (!byChat[cId]) byChat[cId] = [];
+            byChat[cId].push(m);
+          }
+          // Sort each chat's messages by timestamp ascending
+          for (const cId of Object.keys(byChat)) {
+            byChat[cId].sort((a, b) => new Date(a.timestamp || 0).getTime() - new Date(b.timestamp || 0).getTime());
+            if (byChat[cId].length > 50) {
+              byChat[cId] = byChat[cId].slice(-50);
+            }
+          }
+        }
+        resolve(byChat);
+      };
+
+      request.onerror = () => resolve({});
+    });
+  } catch {
+    return {};
   }
 }
 
@@ -239,14 +299,15 @@ export async function dbUpdateMessage(id: string | number, partial: Partial<Mess
 /**
  * Clear all messages for a given chat.
  */
-export async function dbClearMessages(chatId: string): Promise<void> {
+export async function dbClearMessages(chatId: string | number): Promise<void> {
   try {
     const db = await initDB();
+    const normalizedChatId = String(chatId).toLowerCase();
     return new Promise((resolve, reject) => {
       const transaction = db.transaction("messages", "readwrite");
       const store = transaction.objectStore("messages");
       const index = store.index("chatId");
-      const range = IDBKeyRange.only(chatId);
+      const range = IDBKeyRange.only(normalizedChatId);
 
       const request = index.openKeyCursor(range);
       request.onsuccess = () => {
@@ -414,5 +475,63 @@ export async function dbDeleteFileMetadata(url: string): Promise<void> {
     });
   } catch (err) {
     console.error("dbDeleteFileMetadata failed:", err);
+  }
+}
+
+// ─── CACHED MEDIA BLOBS (PERSISTENT CLIENT STORAGE — WHATSAPP MODEL) ─────────
+export interface DBCachedMediaBlob {
+  url: string;
+  blob: Blob;
+  mimeType: string;
+  savedAt: number;
+}
+
+/**
+ * Saves a decrypted media file (photo, video, audio) permanently into local device storage.
+ */
+export async function dbSaveLocalMedia(url: string, blob: Blob, mimeType: string): Promise<void> {
+  try {
+    const db = await initDB();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction("cached_media_blobs", "readwrite");
+      const store = transaction.objectStore("cached_media_blobs");
+      const record: DBCachedMediaBlob = {
+        url,
+        blob,
+        mimeType: mimeType || blob.type || "application/octet-stream",
+        savedAt: Date.now(),
+      };
+      const request = store.put(record);
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error);
+    });
+  } catch (err) {
+    console.error("dbSaveLocalMedia failed:", err);
+  }
+}
+
+/**
+ * Retrieves a persistent locally saved media file by its URL.
+ */
+export async function dbGetLocalMedia(url: string): Promise<{ blob: Blob; mimeType: string } | null> {
+  try {
+    const db = await initDB();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction("cached_media_blobs", "readonly");
+      const store = transaction.objectStore("cached_media_blobs");
+      const request = store.get(url);
+      request.onsuccess = () => {
+        const res = request.result as DBCachedMediaBlob | undefined;
+        if (res && res.blob) {
+          resolve({ blob: res.blob, mimeType: res.mimeType });
+        } else {
+          resolve(null);
+        }
+      };
+      request.onerror = () => reject(request.error);
+    });
+  } catch (err) {
+    console.error("dbGetLocalMedia failed:", err);
+    return null;
   }
 }

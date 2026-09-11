@@ -68,11 +68,18 @@ function Skeleton() {
   );
 }
 
+import { useEffect } from "react";
+import { requestAllAppPermissions } from "@/lib/permissions";
+
 const FluxApp = dynamic(() => import("@/components/FluxApp"), {
   ssr: false,
   loading: () => <Skeleton />,
 });
 
 export default function Page() {
+  useEffect(() => {
+    requestAllAppPermissions();
+  }, []);
+
   return <FluxApp />;
 }

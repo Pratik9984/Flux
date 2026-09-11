@@ -4,6 +4,7 @@ import React, { useState, useMemo } from "react";
 import { parseTs } from "@/lib/utils";
 import type { Contact, Chat, CallLogEntry, Message, ProfileTab } from "@/types";
 import CallLogRow from "../call/CallLogRow";
+import { AvatarImage } from "@/components/ui/AvatarImage";
 
 // ─── CONTACT PROFILE ──────────────────────────────────────────────────────────
 export interface ContactProfileProps {
@@ -14,12 +15,16 @@ export interface ContactProfileProps {
   onNicknameEdit: () => void; getPeerName: (email: string) => string;
   onViewFile: (url: string, type: string) => void;
   isBlocked: boolean; onBlock: () => void; onUnblock: () => void;
+  isContact?: boolean;
+  onRemoveContact?: () => void;
+  onAddContact?: () => void;
 }
 
 export default function ContactProfile({
   contact: c, activeChat, nicknames, contactLabel, callLogs,
   messages, onClose, onCall, onNicknameEdit, onViewFile,
   isBlocked, onBlock, onUnblock,
+  isContact = true, onRemoveContact, onAddContact,
 }: ContactProfileProps) {
   const [tab, setTab] = useState<ProfileTab>("info");
   const label = c ? contactLabel(c) : activeChat.name;
@@ -49,10 +54,11 @@ export default function ContactProfile({
       <div className="pfs-cover">
         <div className="pfs-cover-img" /><div className="pfs-cover-bg" />
         <div className="pfs-avatar" onClick={() => { if (avatarUrl) onViewFile(avatarUrl, "avatar-circle"); }}>
-          {avatarUrl ? <img src={avatarUrl} alt="Profile" className="img-cover" /> : label?.[0]?.toUpperCase() || "?"}
+          {avatarUrl ? <AvatarImage src={avatarUrl} alt="Profile" className="img-cover" fallbackText={label} /> : label?.[0]?.toUpperCase() || "?"}
         </div>
         <div className="pfs-name">{label}</div>
         {c?.username && <div className="pfs-username">@{c.username}</div>}
+        {c?.about && <div style={{ fontSize: "13px", color: "rgba(255,255,255,0.9)", marginTop: 2, textAlign: "center", maxWidth: "85%", whiteSpace: "pre-wrap" }}>{c.about}</div>}
         <div className={`pfs-status-badge ${c?.is_online ? "online" : "offline"}`}>
           <span className="pfs-dot" />{c?.is_online ? "Online" : "Offline"}
         </div>
@@ -91,6 +97,10 @@ export default function ContactProfile({
               </div>
             )}
             <div className="pfs-info-row">
+              <div className="pfs-info-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10" /><line x1="12" y1="16" x2="12" y2="12" /><line x1="12" y1="8" x2="12.01" y2="8" /></svg></div>
+              <div style={{ flex: 1 }}><div className="pfs-info-label">About</div><div className="pfs-info-val" style={{ color: c?.about ? "#181c1f" : "#8a9096", whiteSpace: "pre-wrap" }}>{c?.about || "Not set"}</div></div>
+            </div>
+            <div className="pfs-info-row">
               <div className="pfs-info-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="2" y="4" width="20" height="16" rx="2" /><path d="m22 7-10 7L2 7" /></svg></div>
               <div><div className="pfs-info-label">Email</div><div className="pfs-info-val">{String(activeChat.id)}</div></div>
             </div>
@@ -98,7 +108,7 @@ export default function ContactProfile({
               <div className="pfs-info-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2" /><circle cx="12" cy="7" r="4" /></svg></div>
               <div style={{ flex: 1 }}>
                 <div className="pfs-info-label">Nickname</div>
-                <div className="pfs-info-val" style={{ color: nicknames[String(activeChat.id)] ? "#fff" : "rgba(255,255,255,0.35)" }}>
+                <div className="pfs-info-val" style={{ color: nicknames[String(activeChat.id)] ? "#181c1f" : "#8a9096" }}>
                   {nicknames[String(activeChat.id)] || "Not set"}
                 </div>
               </div>
@@ -106,10 +116,53 @@ export default function ContactProfile({
                 {nicknames[String(activeChat.id)] ? "Edit" : "Add"}
               </button>
             </div>
-            <div className="pfs-info-row" style={{ marginTop: "1.5rem", borderTop: "1px solid rgba(255,255,255,0.08)", paddingTop: "1.5rem" }}>
+            <div style={{ marginTop: "1rem", paddingTop: "0.5rem", display: "flex", flexDirection: "column", gap: 10 }}>
+              {isContact ? (
+                onRemoveContact && (
+                  <button
+                    type="button"
+                    className="cp-block-btn"
+                    onClick={onRemoveContact}
+                    style={{
+                      background: "#fff7e6",
+                      color: "#d46b08",
+                      border: "1px solid rgba(212,107,8,0.25)",
+                      padding: "12px 16px",
+                      borderRadius: "14px",
+                      width: "100%",
+                      cursor: "pointer",
+                      fontWeight: 700,
+                      fontSize: "14px",
+                    }}
+                  >
+                    Remove from Contacts
+                  </button>
+                )
+              ) : (
+                onAddContact && (
+                  <button
+                    type="button"
+                    className="cp-block-btn"
+                    onClick={onAddContact}
+                    style={{
+                      background: "rgba(109, 175, 120, 0.12)",
+                      color: "#4e9158",
+                      border: "1px solid rgba(109, 175, 120, 0.3)",
+                      padding: "12px 16px",
+                      borderRadius: "14px",
+                      width: "100%",
+                      cursor: "pointer",
+                      fontWeight: 700,
+                      fontSize: "14px",
+                    }}
+                  >
+                    + Add to Contacts
+                  </button>
+                )
+              )}
               {isBlocked
-                ? <button className="cp-block-btn unblock-btn" onClick={onUnblock} style={{ background: "rgba(76,175,80,0.1)", color: "#4caf50", border: "1px solid rgba(76,175,80,0.2)", padding: "10px 16px", borderRadius: "12px", width: "100%", cursor: "pointer", fontWeight: "bold" }}>Unblock User</button>
-                : <button className="cp-block-btn block-btn" onClick={onBlock} style={{ background: "rgba(244,67,54,0.1)", color: "#f44336", border: "1px solid rgba(244,67,54,0.2)", padding: "10px 16px", borderRadius: "12px", width: "100%", cursor: "pointer", fontWeight: "bold" }}>Block User</button>}
+                ? <button className="cp-block-btn unblock-btn" onClick={onUnblock} style={{ background: "#ebf5ee", color: "#2e7d32", border: "1px solid rgba(46,125,50,0.2)", padding: "12px 16px", borderRadius: "14px", width: "100%", cursor: "pointer", fontWeight: 700, fontSize: "14px" }}>Unblock User</button>
+                : <button className="cp-block-btn block-btn" onClick={onBlock} style={{ background: "#fff0f0", color: "#d32f2f", border: "1px solid rgba(211,47,47,0.15)", padding: "12px 16px", borderRadius: "14px", width: "100%", cursor: "pointer", fontWeight: 700, fontSize: "14px" }}>Block User</button>}
             </div>
           </div>
         )}

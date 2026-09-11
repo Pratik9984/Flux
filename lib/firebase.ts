@@ -1,5 +1,6 @@
-import { initializeApp, getApps } from 'firebase/app';
-import { getMessaging, getToken, onMessage } from 'firebase/messaging';
+import { initializeApp, getApps, getApp, type FirebaseApp } from 'firebase/app';
+import type { Messaging } from 'firebase/messaging';
+import { isNative, requestNotifyPermission as requestNativePermission } from './notifications';
 
 const firebaseConfig = {
     apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
@@ -10,31 +11,96 @@ const firebaseConfig = {
     appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID,
 };
 
-const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApps()[0];
+function getFirebaseApp(): FirebaseApp | null {
+    if (typeof window === 'undefined') return null;
+    try {
+        return getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
+    } catch (e) {
+        console.warn('Firebase initializeApp warning:', e);
+        return null;
+    }
+}
 
-export const messaging = typeof window !== 'undefined' ? getMessaging(app) : null;
+// Lazy safe getter for Messaging instance
+let messagingInstance: Messaging | null = null;
+let messagingInitPromise: Promise<Messaging | null> | null = null;
+
+export async function getMessagingSafe(): Promise<Messaging | null> {
+    if (typeof window === 'undefined') return null;
+    if (messagingInstance) return messagingInstance;
+    if (messagingInitPromise) return messagingInitPromise;
+
+    messagingInitPromise = (async () => {
+        try {
+            const { isSupported, getMessaging } = await import('firebase/messaging');
+            const supported = await isSupported().catch(() => false);
+            if (!supported) {
+                return null;
+            }
+            const app = getFirebaseApp();
+            if (!app) return null;
+            messagingInstance = getMessaging(app);
+            return messagingInstance;
+        } catch (err) {
+            console.warn('Firebase messaging is not supported in this environment:', err);
+            return null;
+        }
+    })();
+
+    return messagingInitPromise;
+}
+
+// Safe fallback export for legacy references
+export const messaging = null;
 
 export const VAPID_KEY = process.env.NEXT_PUBLIC_FIREBASE_VAPID_KEY;
 
+/**
+ * Unified FCM token requester: uses Native Capacitor Push Notifications on Android,
+ * and Web Service Worker FCM on browser.
+ */
 export async function requestNotificationPermission(): Promise<string | null> {
-    if (!messaging) return null;
+    if (typeof window === 'undefined') return null;
 
+    // 1. Try Native Capacitor Android Push first
+    if (isNative()) {
+        try {
+            const nativeTok = await requestNativePermission();
+            if (nativeTok) return nativeTok;
+        } catch (err) {
+            console.warn('Native push token error, attempting Web VAPID fallback:', err);
+        }
+    }
+
+    // 2. Web Browser & Hybrid Fallback using Firebase VAPID Key
     try {
+        if (typeof Notification === 'undefined') return null;
         const permission = await Notification.requestPermission();
         if (permission !== 'granted') return null;
 
-        // Register service worker first
-        const sw = await navigator.serviceWorker.register('/firebase-messaging-sw.js');
+        const msg = await getMessagingSafe();
+        if (!msg) return null;
 
-        const token = await getToken(messaging, {
+        let sw: ServiceWorkerRegistration | undefined = undefined;
+        if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
+            sw = await navigator.serviceWorker.register('/firebase-messaging-sw.js').catch(() => undefined);
+        }
+
+        const { getToken } = await import('firebase/messaging');
+        const token = await getToken(msg, {
             vapidKey: VAPID_KEY,
             serviceWorkerRegistration: sw,
         });
 
-        return token;
-    } catch (err) {
-        console.error('FCM token error:', err);
+        if (token) {
+            try { localStorage.setItem('flux_native_push_token', token); } catch {}
+            return token;
+        }
         return null;
+    } catch (err) {
+        console.warn('FCM token registration fallback error:', err);
+        const cached = typeof window !== 'undefined' ? localStorage.getItem('flux_native_push_token') : null;
+        return cached || null;
     }
 }
 
@@ -46,38 +112,52 @@ export async function requestNotificationPermission(): Promise<string | null> {
 export function setupForegroundFCM(
     onForegroundMessage: (payload: any) => void,
     onTokenRefresh: (newToken: string) => void,
-): (() => void) | null {
-    if (!messaging) return null;
+): (() => void) {
+    let unsubMessage: (() => void) | null = null;
+    let refreshInterval: ReturnType<typeof setInterval> | null = null;
+    let cancelled = false;
 
-    // Listen for foreground push messages
-    const unsubMessage = onMessage(messaging, (payload) => {
-        onForegroundMessage(payload);
-    });
+    if (isNative()) {
+        // Native notifications are handled directly by @capacitor/push-notifications in initNotifications
+        return () => {};
+    }
 
-    // Periodically check for token refresh (FCM doesn't have a dedicated onTokenRefresh event in v9+)
-    // Re-fetch token every 30 minutes; if it changed, notify the caller
-    let lastKnownToken: string | null = null;
-    const refreshInterval = setInterval(async () => {
+    (async () => {
         try {
-            const sw = await navigator.serviceWorker.ready;
-            const freshToken = await getToken(messaging!, {
-                vapidKey: VAPID_KEY,
-                serviceWorkerRegistration: sw,
+            const msg = await getMessagingSafe();
+            if (!msg || cancelled) return;
+
+            const { onMessage, getToken } = await import('firebase/messaging');
+
+            unsubMessage = onMessage(msg, (payload) => {
+                onForegroundMessage(payload);
             });
-            if (freshToken && freshToken !== lastKnownToken) {
-                if (lastKnownToken !== null) {
-                    // Token actually changed (not initial fetch)
-                    onTokenRefresh(freshToken);
-                }
-                lastKnownToken = freshToken;
-            }
-        } catch { }
-    }, 30 * 60 * 1000);
+
+            let lastKnownToken: string | null = null;
+            refreshInterval = setInterval(async () => {
+                try {
+                    if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return;
+                    const sw = await navigator.serviceWorker.ready;
+                    const freshToken = await getToken(msg, {
+                        vapidKey: VAPID_KEY,
+                        serviceWorkerRegistration: sw,
+                    });
+                    if (freshToken && freshToken !== lastKnownToken) {
+                        if (lastKnownToken !== null) {
+                            onTokenRefresh(freshToken);
+                        }
+                        lastKnownToken = freshToken;
+                    }
+                } catch { }
+            }, 30 * 60 * 1000);
+        } catch (err) {
+            console.warn('setupForegroundFCM warning:', err);
+        }
+    })();
 
     return () => {
-        unsubMessage();
-        clearInterval(refreshInterval);
+        cancelled = true;
+        if (unsubMessage) unsubMessage();
+        if (refreshInterval) clearInterval(refreshInterval);
     };
 }
-
-export { onMessage };

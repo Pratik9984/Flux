@@ -5,6 +5,7 @@ import { formatTimeAgo } from "@/lib/utils";
 import type { Contact } from "@/types";
 import { useChatStore } from "@/stores/chatStore";
 import { useContactStore } from "@/stores/contactStore";
+import { AvatarImage } from "@/components/ui/AvatarImage";
 
 export interface ContactItemProps {
   contact: Contact;
@@ -73,11 +74,12 @@ const ContactItem = memo(function ContactItem({
         className={`sb-item ${isActive ? "sb-item--active" : ""} ${hasUnread && !isActive ? "sb-item--unread" : ""}`}
       >
         <div className="sb-av" onClick={(e) => { e.stopPropagation(); onOpenProfile?.(c.email, label); }}>
-          {c.avatar_url ? (
-            <img src={c.avatar_url} alt="avatar" className="img-cover rounded-circle" />
-          ) : (
-            label?.[0]?.toUpperCase() || "?"
-          )}
+          <AvatarImage
+            src={c.avatar_url}
+            alt={label}
+            fallbackText={label}
+            className="img-cover rounded-circle"
+          />
           <span className={`pres ${c.is_online ? "pres--on" : ""}`} />
         </div>
         <div className="sb-item-body mw-0">
@@ -90,12 +92,17 @@ const ContactItem = memo(function ContactItem({
             ) : (
               <span>{label}</span>
             )}
+            {c.not_in_contacts && (
+              <span className="not-in-contacts-pill" style={{ fontSize: "9px", padding: "1px 5px", borderRadius: "8px", background: "rgba(239, 68, 68, 0.15)", color: "#ef4444", fontWeight: 600, marginLeft: "5px", flexShrink: 0 }}>
+                Not in contacts
+              </span>
+            )}
           </span>
           <span className={`sb-item-status text-truncate ${hasUnread ? "sb-item-status--unread" : ""}`}>
             {lastPreview ? (
               lastPreview.substring(0, 34) + (lastPreview.length > 34 ? "…" : "")
             ) : c.username ? (
-              <span style={{ opacity: 0.5 }}>@{c.username}</span>
+              <span style={{ color: "var(--text-2)", fontWeight: 500 }}>@{c.username}</span>
             ) : (
               <span className={c.is_online ? "online" : ""}>{c.is_online ? "● Online" : "○ Offline"}</span>
             )}

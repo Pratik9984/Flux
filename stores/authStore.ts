@@ -4,14 +4,14 @@ import type { AuthState, AuthStep } from "@/types";
 export interface AuthStoreState {
   token: string;
   currentUser: string;
-  profile: { displayName: string; avatarUrl: string; username: string };
+  profile: { displayName: string; avatarUrl: string; username: string; about?: string };
   auth: AuthState;
   isMounted: boolean;
 
   setToken: (token: string) => void;
   setCurrentUser: (user: string) => void;
-  setProfile: (profile: { displayName: string; avatarUrl: string; username: string }) => void;
-  updateProfile: (partial: Partial<{ displayName: string; avatarUrl: string; username: string }>) => void;
+  setProfile: (profile: { displayName: string; avatarUrl: string; username: string; about?: string }) => void;
+  updateProfile: (partial: Partial<{ displayName: string; avatarUrl: string; username: string; about?: string }>) => void;
   setAuthField: (field: keyof AuthState, value: any) => void;
   setAuthStep: (step: AuthStep) => void;
   setAuthLoading: (loading: boolean) => void;
@@ -34,14 +34,20 @@ const authInit: AuthState = {
 export const useAuthStore = create<AuthStoreState>((set) => ({
   token: typeof window !== "undefined" ? localStorage.getItem("flux_backend_token") || "" : "",
   currentUser: typeof window !== "undefined" ? localStorage.getItem("chat_user") || "" : "",
-  profile: { displayName: "", avatarUrl: "", username: "" },
+  profile: typeof window !== "undefined" && localStorage.getItem("flux_cached_profile")
+    ? JSON.parse(localStorage.getItem("flux_cached_profile") || "{}")
+    : { displayName: "", avatarUrl: "", username: "", about: "" },
   auth: authInit,
   isMounted: false,
 
   setToken: (token) => {
     if (typeof window !== "undefined") {
-      if (token) localStorage.setItem("flux_backend_token", token);
-      else localStorage.removeItem("flux_backend_token");
+      if (token) {
+        localStorage.setItem("flux_backend_token", token);
+        try { (window as any).FluxNativeBridge?.syncAuthToken(token); } catch {}
+      } else {
+        localStorage.removeItem("flux_backend_token");
+      }
     }
     set({ token });
   },
@@ -52,9 +58,20 @@ export const useAuthStore = create<AuthStoreState>((set) => ({
     }
     set({ currentUser: user });
   },
-  setProfile: (profile) => set({ profile }),
+  setProfile: (profile) => {
+    if (typeof window !== "undefined") {
+      try { localStorage.setItem("flux_cached_profile", JSON.stringify(profile)); } catch { }
+    }
+    set({ profile });
+  },
   updateProfile: (partial) =>
-    set((s) => ({ profile: { ...s.profile, ...partial } })),
+    set((s) => {
+      const next = { ...s.profile, ...partial };
+      if (typeof window !== "undefined") {
+        try { localStorage.setItem("flux_cached_profile", JSON.stringify(next)); } catch { }
+      }
+      return { profile: next };
+    }),
   setAuthField: (field, value) =>
     set((s) => ({ auth: { ...s.auth, [field]: value } })),
   setAuthStep: (step) =>
