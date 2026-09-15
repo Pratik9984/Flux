@@ -11,7 +11,7 @@ export interface DBCachedFile {
 }
 
 const DB_NAME = "FluxLocalDB";
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 
 let dbInstance: IDBDatabase | null = null;
 
@@ -53,6 +53,12 @@ export function initDB(): Promise<IDBDatabase> {
       // 4. cached_media_blobs store (persistent decrypted chat media)
       if (!db.objectStoreNames.contains("cached_media_blobs")) {
         db.createObjectStore("cached_media_blobs", { keyPath: "url" });
+      }
+
+      // 5. outbox store (offline message queue)
+      if (!db.objectStoreNames.contains("outbox")) {
+        const outboxStore = db.createObjectStore("outbox", { keyPath: "id" });
+        outboxStore.createIndex("timestamp", "timestamp", { unique: false });
       }
     };
 
@@ -535,3 +541,88 @@ export async function dbGetLocalMedia(url: string): Promise<{ blob: Blob; mimeTy
     return null;
   }
 }
+
+// ─── OUTBOX QUEUE (ZERO-LAG OFFLINE RESILIENCE) ──────────────────────────────
+export interface OutboxItem {
+  id: string; // client temporary ID (e.g. temp-...)
+  chatId: string;
+  chatType: "user" | "group";
+  payload: any;
+  timestamp: number;
+  retryCount: number;
+}
+
+export async function dbEnqueueOutbox(item: OutboxItem): Promise<void> {
+  try {
+    const db = await initDB();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction("outbox", "readwrite");
+      const store = transaction.objectStore("outbox");
+      const req = store.put(item);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+  } catch (err) {
+    console.error("dbEnqueueOutbox failed:", err);
+  }
+}
+
+export async function dbGetPendingOutbox(): Promise<OutboxItem[]> {
+  try {
+    const db = await initDB();
+    return new Promise((resolve) => {
+      const transaction = db.transaction("outbox", "readonly");
+      const store = transaction.objectStore("outbox");
+      const req = store.getAll();
+      req.onsuccess = () => {
+        const items = (req.result || []) as OutboxItem[];
+        items.sort((a, b) => a.timestamp - b.timestamp);
+        resolve(items);
+      };
+      req.onerror = () => resolve([]);
+    });
+  } catch {
+    return [];
+  }
+}
+
+export async function dbRemoveFromOutbox(id: string): Promise<void> {
+  try {
+    const db = await initDB();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction("outbox", "readwrite");
+      const store = transaction.objectStore("outbox");
+      const req = store.delete(id);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+  } catch (err) {
+    console.error("dbRemoveFromOutbox failed:", err);
+  }
+}
+
+export async function dbUpdateOutboxRetry(id: string): Promise<void> {
+  try {
+    const db = await initDB();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction("outbox", "readwrite");
+      const store = transaction.objectStore("outbox");
+      const getReq = store.get(id);
+      getReq.onsuccess = () => {
+        const item = getReq.result as OutboxItem | undefined;
+        if (item) {
+          item.retryCount = (item.retryCount || 0) + 1;
+          const putReq = store.put(item);
+          putReq.onsuccess = () => resolve();
+          putReq.onerror = () => reject(putReq.error);
+        } else {
+          resolve();
+        }
+      };
+      getReq.onerror = () => reject(getReq.error);
+    });
+  } catch (err) {
+    console.error("dbUpdateOutboxRetry failed:", err);
+  }
+}
+

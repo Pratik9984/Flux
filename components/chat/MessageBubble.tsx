@@ -8,6 +8,8 @@ import { useContactStore } from "@/stores/contactStore";
 import { useCachedMedia } from "@/hooks/useCachedMedia";
 import ReactionPickerPortal from "./ReactionPickerPortal";
 import FormattedMessageText from "./FormattedMessageText";
+import VoiceNotePlayer from "./VoiceNotePlayer";
+import ViewOnceModal from "./ViewOnceModal";
 
 // ─── STATIC REACTION EMOJIS ──────────────────────────────────────────────────
 const REACTION_EMOJIS = ["👍", "❤️", "😂", "😮", "😢", "🙏", "🔥", "💯"];
@@ -17,11 +19,15 @@ export function StatusTicks({
   isMine,
   isFailed,
   isPending,
+  isDelivered,
+  isRead,
   readBy,
 }: {
   isMine: boolean;
   isFailed?: boolean;
   isPending?: boolean;
+  isDelivered?: boolean;
+  isRead?: boolean;
   readBy?: string[];
 }) {
   if (!isMine) return null;
@@ -37,7 +43,7 @@ export function StatusTicks({
   if (isPending) {
     return (
       <span className="status-tick status-tick--pending" title="Sending...">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ opacity: 0.7 }}>
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ opacity: 0.75 }}>
           <circle cx="12" cy="12" r="10" />
           <polyline points="12 6 12 12 16 14" />
         </svg>
@@ -45,26 +51,38 @@ export function StatusTicks({
     );
   }
 
-  const isRead = Boolean(readBy && readBy.length > 0);
+  const hasRead = Boolean(isRead || (readBy && readBy.length > 0));
 
-  return (
-    <span
-      className={`status-tick ${isRead ? "status-tick--read" : "status-tick--delivered"}`}
-      title={isRead ? "Read" : "Delivered"}
-    >
-      {isRead ? (
-        // Standard Double Blue / Cyan Checkmark
+  if (hasRead) {
+    return (
+      <span className="status-tick status-tick--read" title="Read">
+        {/* WhatsApp Double Blue / Cyan Checkmark */}
         <svg width="16" height="11" viewBox="0 0 16 11" fill="none" className="tick-svg tick-svg--read">
           <path d="M1 5.5L4.5 9L11.5 1.5" stroke="#53bdeb" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" />
           <path d="M5 5.5L8.5 9L15.5 1.5" stroke="#53bdeb" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" />
         </svg>
-      ) : (
-        // Standard Double Grey Checkmark
+      </span>
+    );
+  }
+
+  if (isDelivered) {
+    return (
+      <span className="status-tick status-tick--delivered" title="Delivered">
+        {/* Double Grey Checkmark */}
         <svg width="16" height="11" viewBox="0 0 16 11" fill="none" className="tick-svg tick-svg--delivered">
-          <path d="M1 5.5L4.5 9L11.5 1.5" stroke="rgba(255,255,255,0.65)" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" />
-          <path d="M5 5.5L8.5 9L15.5 1.5" stroke="rgba(255,255,255,0.65)" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" />
+          <path d="M1 5.5L4.5 9L11.5 1.5" stroke="rgba(255,255,255,0.7)" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" />
+          <path d="M5 5.5L8.5 9L15.5 1.5" stroke="rgba(255,255,255,0.7)" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" />
         </svg>
-      )}
+      </span>
+    );
+  }
+
+  // Single Checkmark (Sent to server)
+  return (
+    <span className="status-tick status-tick--sent" title="Sent">
+      <svg width="14" height="11" viewBox="0 0 14 11" fill="none" className="tick-svg tick-svg--sent">
+        <path d="M1 5.5L4.5 9L12.5 1.5" stroke="rgba(255,255,255,0.7)" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
     </span>
   );
 }
@@ -225,7 +243,17 @@ const MessageBubble = memo(function MessageBubble({
     caption = lines.slice(1).join("\n").trim();
   };
 
-  if (content.startsWith("[ENC_IMAGE]")) {
+  let isViewOnce = Boolean(item.is_view_once);
+  const [viewOnceOpen, setViewOnceOpen] = useState(false);
+  const [isOpened, setIsOpened] = useState(Boolean(item.is_opened));
+
+  if (content.startsWith("[VIEW_ONCE_IMAGE]")) {
+    isViewOnce = true;
+    parseEncTag(content.slice(17), "image");
+  } else if (content.startsWith("[VIEW_ONCE_VIDEO]")) {
+    isViewOnce = true;
+    parseEncTag(content.slice(17), "video");
+  } else if (content.startsWith("[ENC_IMAGE]")) {
     parseEncTag(content.slice(11), "image");
   } else if (content.startsWith("[ENC_VIDEO]")) {
     parseEncTag(content.slice(11), "video");
@@ -532,6 +560,91 @@ const MessageBubble = memo(function MessageBubble({
                     <div style={{ fontSize: "0.75rem", opacity: 0.8 }}>Saved on sender/receiver original devices</div>
                   </div>
                 </div>
+              ) : isViewOnce ? (
+                // ── VIEW ONCE EPHEMERAL MEDIA (WHATSAPP / INSTAGRAM STYLE) ──
+                <div className="msg-view-once-box" style={{ padding: "4px 2px" }}>
+                  {isOpened ? (
+                    <div
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: "8px",
+                        padding: "8px 14px",
+                        borderRadius: "18px",
+                        background: isMine ? "rgba(255,255,255,0.15)" : "rgba(0,0,0,0.06)",
+                        color: isMine ? "#fff" : "var(--text-3, #888)",
+                        opacity: 0.75,
+                        fontSize: "13px",
+                        fontWeight: 600,
+                        userSelect: "none",
+                      }}
+                    >
+                      <span style={{ fontSize: "15px" }}>①</span>
+                      <span>{isImage ? "Photo" : "Video"} (Opened)</span>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (mediaSrc && mediaSrc !== "EXPIRED") {
+                          setViewOnceOpen(true);
+                        }
+                      }}
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: "8px",
+                        padding: "8px 16px",
+                        borderRadius: "20px",
+                        background: isMine ? "rgba(255,255,255,0.22)" : "rgba(37, 211, 102, 0.14)",
+                        border: isMine ? "1px solid rgba(255,255,255,0.3)" : "1px solid rgba(37, 211, 102, 0.4)",
+                        color: isMine ? "#fff" : "#128C7E",
+                        fontSize: "13px",
+                        fontWeight: 700,
+                        cursor: "pointer",
+                        boxShadow: "0 2px 8px rgba(0,0,0,0.06)",
+                        transition: "transform 0.15s ease",
+                      }}
+                    >
+                      <span style={{ fontSize: "16px", color: isMine ? "#fff" : "#25d366" }}>①</span>
+                      <span>View {isImage ? "Photo" : "Video"}</span>
+                    </button>
+                  )}
+                  {viewOnceOpen && mediaSrc && (
+                    <ViewOnceModal
+                      url={mediaSrc}
+                      type={isImage ? "image" : "video"}
+                      onClose={() => {
+                        setViewOnceOpen(false);
+                        setIsOpened(true);
+                        if (item.id && !String(item.id).startsWith("temp-")) {
+                          const token = useAuthStore.getState().token;
+                          if (token) {
+                            import("@/lib/api").then(({ API }) => {
+                              fetch(`${API}/messages/${item.id}/view-once-opened`, {
+                                method: "POST",
+                                headers: { Authorization: `Bearer ${token}` },
+                              }).catch(() => {});
+                            });
+                          }
+                        }
+                      }}
+                    />
+                  )}
+                  <div className="msg-footer msg-meta" style={{ marginTop: "4px" }}>
+                    {item.is_edited && <span className="msg-edited msg-meta-edited">edited</span>}
+                    <span className="msg-ts msg-meta-time">{formatTime(item.timestamp)}</span>
+                    <StatusTicks
+                      isMine={isMine}
+                      isFailed={isFailed}
+                      isPending={isPending}
+                      isDelivered={Boolean(item.is_delivered)}
+                      isRead={Boolean(item.is_read || (item.read_by && item.read_by.length > 0))}
+                      readBy={item.read_by}
+                    />
+                  </div>
+                </div>
               ) : isImage || isVideo ? (
                 // ── IMAGE & VIDEO MEDIA BOX WITH OVERLAY META ──
                 <div className="msg-media-box" onClick={() => (mediaSrc && mediaSrc !== "EXPIRED") && onViewFile(mediaSrc, isImage ? "image" : "video")}>
@@ -578,33 +691,40 @@ const MessageBubble = memo(function MessageBubble({
                   <div className="media-overlay-meta">
                     {item.is_edited && <span className="media-meta-edited">edited</span>}
                     <span className="media-meta-time">{formatTime(item.timestamp)}</span>
-                    <StatusTicks isMine={isMine} isFailed={isFailed} isPending={isPending} readBy={item.read_by} />
+                    <StatusTicks
+                      isMine={isMine}
+                      isFailed={isFailed}
+                      isPending={isPending}
+                      isDelivered={Boolean(item.is_delivered)}
+                      isRead={Boolean(item.is_read || (item.read_by && item.read_by.length > 0))}
+                      readBy={item.read_by}
+                    />
                   </div>
                 </div>
               ) : isAudio ? (
-                // ── AUDIO / VOICE NOTE ──
+                // ── AUDIO / INTERACTIVE VOICE NOTE WAVEFORM ──
                 <>
-                  <div className="msg-attachment-audio">
+                  <div className="msg-attachment-audio" style={{ padding: "2px 0" }}>
                     {encKey && !mediaSrc ? (
                       <div style={{ padding: "10px 16px", display: "flex", alignItems: "center", gap: 8, fontSize: "0.85rem", opacity: 0.8, color: "var(--text-1)" }}>
                         <div style={{ width: 16, height: 16, border: "2px solid rgba(0,0,0,0.15)", borderTopColor: "var(--green, #25d366)", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
                         <span>Loading audio...</span>
                       </div>
                     ) : (
-                      <audio
-                        src={mediaSrc}
-                        controls
-                        className="msg-audio-media"
-                        onError={() => {
-                          if (!encKey && mediaSrc !== rawUrl && rawUrl) setMediaSrc(rawUrl);
-                        }}
-                      />
+                      <VoiceNotePlayer src={mediaSrc} isMine={isMine} />
                     )}
                   </div>
                   <div className="msg-footer msg-meta">
                     {item.is_edited && <span className="msg-edited msg-meta-edited">edited</span>}
                     <span className="msg-ts msg-meta-time">{formatTime(item.timestamp)}</span>
-                    <StatusTicks isMine={isMine} isFailed={isFailed} isPending={isPending} readBy={item.read_by} />
+                    <StatusTicks
+                      isMine={isMine}
+                      isFailed={isFailed}
+                      isPending={isPending}
+                      isDelivered={Boolean(item.is_delivered)}
+                      isRead={Boolean(item.is_read || (item.read_by && item.read_by.length > 0))}
+                      readBy={item.read_by}
+                    />
                   </div>
                 </>
               ) : isPdf || isFile ? (
@@ -626,7 +746,14 @@ const MessageBubble = memo(function MessageBubble({
                   <div className="msg-footer msg-meta">
                     {item.is_edited && <span className="msg-edited msg-meta-edited">edited</span>}
                     <span className="msg-ts msg-meta-time">{formatTime(item.timestamp)}</span>
-                    <StatusTicks isMine={isMine} isFailed={isFailed} isPending={isPending} readBy={item.read_by} />
+                    <StatusTicks
+                      isMine={isMine}
+                      isFailed={isFailed}
+                      isPending={isPending}
+                      isDelivered={Boolean(item.is_delivered)}
+                      isRead={Boolean(item.is_read || (item.read_by && item.read_by.length > 0))}
+                      readBy={item.read_by}
+                    />
                   </div>
                 </>
               ) : isSticker ? (
@@ -642,7 +769,14 @@ const MessageBubble = memo(function MessageBubble({
                   />
                   <div className="msg-footer msg-meta" style={{ justifyContent: "center" }}>
                     <span className="msg-ts msg-meta-time">{formatTime(item.timestamp)}</span>
-                    <StatusTicks isMine={isMine} isFailed={isFailed} isPending={isPending} readBy={item.read_by} />
+                    <StatusTicks
+                      isMine={isMine}
+                      isFailed={isFailed}
+                      isPending={isPending}
+                      isDelivered={Boolean(item.is_delivered)}
+                      isRead={Boolean(item.is_read || (item.read_by && item.read_by.length > 0))}
+                      readBy={item.read_by}
+                    />
                   </div>
                 </div>
               ) : (
@@ -654,7 +788,14 @@ const MessageBubble = memo(function MessageBubble({
                   <div className="msg-footer msg-meta">
                     {item.is_edited && <span className="msg-edited msg-meta-edited">edited</span>}
                     <span className="msg-ts msg-meta-time">{formatTime(item.timestamp)}</span>
-                    <StatusTicks isMine={isMine} isFailed={isFailed} isPending={isPending} readBy={item.read_by} />
+                    <StatusTicks
+                      isMine={isMine}
+                      isFailed={isFailed}
+                      isPending={isPending}
+                      isDelivered={Boolean(item.is_delivered)}
+                      isRead={Boolean(item.is_read || (item.read_by && item.read_by.length > 0))}
+                      readBy={item.read_by}
+                    />
                   </div>
                 </>
               )}

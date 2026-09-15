@@ -19,7 +19,7 @@ import {
 import { API, WS_URL, uploadMediaToBackend, fetchStatuses } from "@/lib/api";
 import { prefetchStatusMedia } from "@/lib/statusPreloader";
 import { idbSet, idbGet, idbGetMany, idbDel } from "@/lib/idb";
-import { dbGetMessages, dbSaveMessages, dbSaveMessage, dbDeleteMessage, dbClearMessages, dbUpdateMessage, dbPreloadRecentMessages } from "@/lib/db";
+import { dbGetMessages, dbSaveMessages, dbSaveMessage, dbDeleteMessage, dbClearMessages, dbUpdateMessage, dbPreloadRecentMessages, dbEnqueueOutbox, dbGetPendingOutbox, dbRemoveFromOutbox } from "@/lib/db";
 import { encryptAvatarBlob } from "@/lib/avatarCrypto";
 import { encryptMediaBlob } from "@/lib/mediaCrypto";
 import { cacheSentMediaLocally } from "@/lib/mediaCache";
@@ -42,6 +42,7 @@ import CallLogRow from "@/components/call/CallLogRow";
 import DragSlider from "@/components/call/DragSlider";
 import MessageInfoModal from "@/components/chat/MessageInfoModal";
 import MessageBubble from "@/components/chat/MessageBubble";
+import VoiceNoteRecorder from "@/components/chat/VoiceNoteRecorder";
 import ContactProfile from "@/components/profile/ContactProfile";
 import GroupProfile from "@/components/profile/GroupProfile";
 import LiveCameraModal from "@/components/chat/LiveCameraModal";
@@ -213,6 +214,8 @@ interface MessageInputSectionProps {
   onTakePhoto?: () => void;
   onPickFile?: () => void;
   wsSend: (msg: string) => void;
+  onVoiceFinish?: (blob: Blob, durationSec: number) => void;
+  onVoiceCancel?: () => void;
 }
 
 const MessageInputSection = memo(function MessageInputSection({
@@ -249,6 +252,8 @@ const MessageInputSection = memo(function MessageInputSection({
   onTakePhoto,
   onPickFile,
   wsSend,
+  onVoiceFinish,
+  onVoiceCancel,
 }: MessageInputSectionProps) {
   const inputMsg = useChatStore(s => s.inputMsg);
   const setInputMsg = useChatStore(s => s.setInputMsg);
@@ -450,18 +455,23 @@ const MessageInputSection = memo(function MessageInputSection({
       {/* ── INPUT BAR ── */}
       <div className="input-bar">
         {isRecording ? (
-          <div style={{ display: "flex", alignItems: "center", flex: 1, padding: "0 10px", gap: 16 }}>
-            <div className="rec-waveform-container">
-              <span className="rec-waveform-bar"></span>
-              <span className="rec-waveform-bar"></span>
-              <span className="rec-waveform-bar"></span>
-              <span className="rec-waveform-bar"></span>
-              <span className="rec-waveform-bar"></span>
-            </div>
-            <span style={{ color: "var(--red)", fontWeight: 600, flex: 1 }}>Recording · {fmtDuration(recordingDuration)}</span>
-            <button onClick={() => { cancelRecordingRef.current = true; toggleRecording(); }} style={{ color: "var(--text-3)", background: "none", border: "none", cursor: "pointer", fontSize: 14 }}>Cancel</button>
-            <button onClick={toggleRecording} className="send-btn" aria-label="Send voice message">➤</button>
-          </div>
+          <VoiceNoteRecorder
+            onFinish={(blob, durationSec) => {
+              if (onVoiceFinish) {
+                onVoiceFinish(blob, durationSec);
+              } else {
+                toggleRecording();
+              }
+            }}
+            onCancel={() => {
+              if (onVoiceCancel) {
+                onVoiceCancel();
+              } else {
+                if (cancelRecordingRef.current) cancelRecordingRef.current = true;
+                toggleRecording();
+              }
+            }}
+          />
         ) : (
           <>
             <input type="file" ref={fileInputRef} onChange={handleFile} accept="image/*,audio/*,video/*,.pdf,.doc,.docx" className="hidden-input" multiple />
@@ -1151,6 +1161,7 @@ export default function FluxChat() {
   const cancelRecordingRef = useRef(false);
   const [pendingFile, setPendingFile] = useState<{ file: File; url: string; type: "image" | "audio" | "video" | "pdf" | "file" } | null>(null);
   const [pendingFiles, setPendingFiles] = useState<{ file: File; url: string; type: "image" | "audio" | "video" | "pdf" | "file"; caption?: string }[]>([]);
+  const [isViewOnceSelected, setIsViewOnceSelected] = useState(false);
   const [multiUploadProgress, setMultiUploadProgress] = useState<{ current: number; total: number } | null>(null);
   const [isNarrowScreen, setIsNarrowScreen] = useState(false);
   const [sidebarFilter, setSidebarFilter] = useState<"all" | "direct" | "groups" | "unread">("all");
@@ -2924,7 +2935,7 @@ export default function FluxChat() {
     return () => observer.disconnect();
   }, [hasMore, loadingMore, messages, activeChat, loadHistory]);
 
-  const wsSend = useCallback((payload: string) => {
+  const wsSend = useCallback((payload: string, outboxItem?: any) => {
     let sent = false;
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       try {
@@ -2943,6 +2954,9 @@ export default function FluxChat() {
       }
     }
     if (!sent) {
+      if (outboxItem) {
+        dbEnqueueOutbox(outboxItem).catch(err => console.warn("Failed to queue outbox item:", err));
+      }
       pendingMessages.current.push(payload);
       if (typeof window !== "undefined" && currentUserRef.current) {
         try {
@@ -3223,6 +3237,19 @@ export default function FluxChat() {
         } catch { }
       }
 
+      dbGetPendingOutbox().then(async (outboxList) => {
+        for (const item of outboxList) {
+          if (ws.readyState === WebSocket.OPEN) {
+            try {
+              ws.send(JSON.stringify(item.payload));
+              await dbRemoveFromOutbox(item.id);
+            } catch (err) {
+              console.warn("Error sending outbox item:", err);
+            }
+          }
+        }
+      }).catch(() => {});
+
       apiFetchRef.current<Record<string, number>>("/unread-counts").then(counts => {
         setUnread(() => {
           const merged: Record<string, number> = {};
@@ -3402,6 +3429,14 @@ export default function FluxChat() {
         if (!dmId.startsWith("temp-")) { seenMessageIds.current.add(dmId); persistSeenIdsRef.current(); }
         updateActivityRef.current(peerEmail, msg.content, msg.timestamp);
         dbSaveMessage(msg, peerEmail).catch(() => {});
+        if (dataUser !== me && wsRef.current?.readyState === WebSocket.OPEN && msg.id) {
+          wsRef.current.send(JSON.stringify({
+            type: "message_delivered",
+            message_id: msg.id,
+            client_msg_id: (data as any).client_msg_id,
+            sender: dataUser,
+          }));
+        }
         const contactExists = contactsRef.current.some(c => c.email.toLowerCase() === peerEmail);
         if (!contactExists) {
           setContacts(prev => {
@@ -3588,6 +3623,64 @@ export default function FluxChat() {
               return m;
             });
           }
+        });
+        break;
+      }
+
+      case "message_ack": {
+        const clientMsgId = (data as any).client_msg_id;
+        const serverMsgId = (data as any).id;
+        if (clientMsgId) {
+          setMessages(prev => {
+            const next = prev.map(m => {
+              if (m.client_msg_id === clientMsgId || m.id === clientMsgId) {
+                return { ...m, id: serverMsgId || m.id, status: "sent" as const, is_delivered: (data as any).is_delivered || false };
+              }
+              return m;
+            });
+            if (activeChatRef.current) {
+              const cacheKey = activeChatRef.current.type === "user" ? String(activeChatRef.current.id).toLowerCase() : String(activeChatRef.current.id);
+              messagesCacheRef.current[cacheKey] = next;
+            }
+            return next;
+          });
+        }
+        break;
+      }
+
+      case "message_delivered": {
+        const serverMsgId = (data as any).id || (data as any).message_id;
+        const clientMsgId = (data as any).client_msg_id;
+        setMessages(prev => {
+          const next = prev.map(m => {
+            if ((serverMsgId && String(m.id) === String(serverMsgId)) || (clientMsgId && m.client_msg_id === clientMsgId)) {
+              return { ...m, is_delivered: true, status: m.is_read ? ("read" as const) : ("delivered" as const) };
+            }
+            return m;
+          });
+          if (activeChatRef.current) {
+            const cacheKey = activeChatRef.current.type === "user" ? String(activeChatRef.current.id).toLowerCase() : String(activeChatRef.current.id);
+            messagesCacheRef.current[cacheKey] = next;
+          }
+          return next;
+        });
+        break;
+      }
+
+      case "view_once_opened": {
+        const msgId = String((data as any).message_id || (data as any).id);
+        setMessages(prev => {
+          const next = prev.map(m => {
+            if (String(m.id) === msgId) {
+              return { ...m, is_opened: true };
+            }
+            return m;
+          });
+          if (activeChatRef.current) {
+            const cacheKey = activeChatRef.current.type === "user" ? String(activeChatRef.current.id).toLowerCase() : String(activeChatRef.current.id);
+            messagesCacheRef.current[cacheKey] = next;
+          }
+          return next;
         });
         break;
       }
@@ -4157,7 +4250,9 @@ export default function FluxChat() {
             await cacheSentMediaLocally(mediaUrl, cleanBlob, mimeType);
           }
 
-          const prefix = item.type === "image" ? "ENC_IMAGE" : item.type === "audio" ? "ENC_AUDIO" : item.type === "video" ? "ENC_VIDEO" : item.type === "pdf" ? "ENC_PDF" : "ENC_FILE";
+          const prefix = isViewOnceSelected
+            ? (item.type === "image" ? "VIEW_ONCE_IMAGE" : "VIEW_ONCE_VIDEO")
+            : (item.type === "image" ? "ENC_IMAGE" : item.type === "audio" ? "ENC_AUDIO" : item.type === "video" ? "ENC_VIDEO" : item.type === "pdf" ? "ENC_PDF" : "ENC_FILE");
           const baseTag = keyB64 
             ? `[${prefix}]${mediaUrl}|${keyB64}|${ivB64}|${encodeURIComponent(mimeType)}|${encodeURIComponent(origFileName)}`
             : (item.type === "image" ? `[IMAGE]${mediaUrl}` : item.type === "audio" ? `[AUDIO]${mediaUrl}` : item.type === "video" ? `[VIDEO]${mediaUrl}` : item.type === "pdf" ? `[PDF]${mediaUrl}` : `[FILE]${mediaUrl}`);
@@ -4165,11 +4260,11 @@ export default function FluxChat() {
 
           // Replace optimistic content with final uploaded tag
           setMessages(prev => {
-            const next = prev.map(m => m.id === tempId ? { ...m, content: tag } : m);
+            const next = prev.map(m => m.id === tempId ? { ...m, content: tag, is_view_once: isViewOnceSelected } : m);
             messagesCacheRef.current[chatIdKey] = next;
             return next;
           });
-          dbSaveMessage({ ...optimisticMsg, content: tag }, chatIdKey).catch(() => {});
+          dbSaveMessage({ ...optimisticMsg, content: tag, is_view_once: isViewOnceSelected }, chatIdKey).catch(() => {});
           updateActivity(id, tag, optimisticMsg.timestamp);
 
           let contentToSend = tag;
@@ -4182,22 +4277,35 @@ export default function FluxChat() {
               if (groupKey) contentToSend = await encryptGroupMsg(tag, groupKey);
             }
           } catch { }
-          wsSend(JSON.stringify({
+
+          const mediaPayload: any = {
             type: chatType === "user" ? "direct_message" : "group_message",
             content: contentToSend,
             message_type: item.type,
+            client_msg_id: tempId,
+            ...(isViewOnceSelected ? { is_view_once: true } : {}),
             ...(chatType === "user" ? { target_user: id } : { group_id: id }),
             ...(replyingTo ? {
               reply_to_id: replyingTo.id,
               reply_to_content: replyingTo.content,
               reply_to_user: replyingTo.user,
             } : {})
-          }));
+          };
+          const outboxItem = {
+            id: tempId,
+            chatId: chatIdKey,
+            chatType: chatType,
+            payload: mediaPayload,
+            timestamp: Date.now(),
+            retryCount: 0,
+          };
+          wsSend(JSON.stringify(mediaPayload), outboxItem);
         }
       } catch (err: any) {
         showToast("Media upload failed: " + (err?.message || "Error"), "error");
       } finally {
         setIsUploadingAttachment(false);
+        setIsViewOnceSelected(false);
         setMultiUploadProgress(null);
         setReplyingTo(null);
       }
@@ -4229,6 +4337,10 @@ export default function FluxChat() {
       user: currentUser,
       content: text,
       timestamp: ts,
+      status: "pending",
+      is_delivered: false,
+      is_read: false,
+      client_msg_id: tempId,
       _dateLabel: getDateLabel(ts),
       ...(type === "user" ? { target_user: String(id) } : { group_id: id, group_name: activeChat.name }),
       ...replyPayload,
@@ -4243,6 +4355,7 @@ export default function FluxChat() {
     const basePayload = {
       type: type === "user" ? "direct_message" : "group_message",
       message_type: "text",
+      client_msg_id: tempId,
       ...(type === "user" ? { target_user: id } : { group_id: id }),
       ...(currentReply ? {
         reply_to_id: currentReply.id,
@@ -4261,7 +4374,16 @@ export default function FluxChat() {
           if (groupKey) contentToSend = await encryptGroupMsg(text, groupKey);
         }
       } catch { }
-      wsSend(JSON.stringify({ ...basePayload, content: contentToSend }));
+      const finalPayload = { ...basePayload, content: contentToSend };
+      const outboxItem = {
+        id: tempId,
+        chatId: chatIdKey,
+        chatType: type,
+        payload: finalPayload,
+        timestamp: Date.now(),
+        retryCount: 0,
+      };
+      wsSend(JSON.stringify(finalPayload), outboxItem);
     })();
   };
 
@@ -4736,6 +4858,70 @@ export default function FluxChat() {
       mr.start();
       setIsRecording(true);
     } catch { showToast("Could not start recording: Microphone access denied or not supported.", "error"); }
+  };
+
+  const sendVoiceNoteBlob = async (blob: Blob, durationSec: number) => {
+    if (!activeChat) return;
+    try {
+      const encRes = await encryptMediaBlob(blob, `voice_${Date.now()}.webm`);
+      const encryptedFile = new File([encRes.encryptedBlob], encRes.fileName, { type: "application/octet-stream" });
+      const uploadRes = await uploadMediaToBackend(encryptedFile, token, encRes.fileName);
+      const audioUrl = uploadRes.url;
+
+      await cacheSentMediaLocally(audioUrl, blob, "audio/webm");
+
+      const tag = `[ENC_AUDIO]${audioUrl}|${encRes.keyB64}|${encRes.ivB64}|audio/webm`;
+      const { type, id } = activeChat;
+      const chatIdKey = type === "user" ? String(id).toLowerCase() : String(id);
+      const tempId = `temp-${Date.now()}-${Math.random()}`;
+      const ts = new Date().toISOString();
+      const optimisticMsg: Message = {
+        id: tempId,
+        user: currentUser,
+        content: tag,
+        timestamp: ts,
+        status: "pending",
+        is_delivered: false,
+        is_read: false,
+        client_msg_id: tempId,
+        _dateLabel: getDateLabel(ts),
+        ...(type === "user" ? { target_user: String(id) } : { group_id: id, group_name: activeChat.name })
+      };
+      setMessages(prev => { const next = [...prev, optimisticMsg]; messagesCacheRef.current[chatIdKey] = next; return next; });
+      dbSaveMessage(optimisticMsg, chatIdKey).catch(() => {});
+      updateActivity(id, tag, optimisticMsg.timestamp);
+      setTimeout(scrollBottom, 50);
+
+      let contentToSend = tag;
+      try {
+        if (type === "user" && e2ePrivKeyRef.current) {
+          const theirPub = await getPeerPubKey(String(id));
+          if (theirPub) contentToSend = await encryptDM(tag, e2ePrivKeyRef.current, theirPub);
+        } else if (type === "group" && e2ePrivKeyRef.current) {
+          const groupKey = await getGroupKey(id);
+          if (groupKey) contentToSend = await encryptGroupMsg(tag, groupKey);
+        }
+      } catch { }
+
+      const msgPayload: any = {
+        type: type === "user" ? "direct_message" : "group_message",
+        content: contentToSend,
+        message_type: "audio",
+        client_msg_id: tempId,
+        ...(type === "user" ? { target_user: id } : { group_id: id })
+      };
+      const outboxItem = {
+        id: tempId,
+        chatId: chatIdKey,
+        chatType: type,
+        payload: msgPayload,
+        timestamp: Date.now(),
+        retryCount: 0,
+      };
+      wsSend(JSON.stringify(msgPayload), outboxItem);
+    } catch (err) {
+      console.warn("sendVoiceNoteBlob failed:", err);
+    }
   };
 
   // ── WEBRTC ────────────────────────────────────────────────────────────────────
@@ -6858,6 +7044,13 @@ export default function FluxChat() {
                     handleFile={handleFile}
                     isNarrowScreen={isNarrowScreen}
                     toggleRecording={toggleRecording}
+                    onVoiceFinish={(blob, durationSec) => {
+                      setIsRecording(false);
+                      sendVoiceNoteBlob(blob, durationSec);
+                    }}
+                    onVoiceCancel={() => {
+                      setIsRecording(false);
+                    }}
                     onSendMessage={sendMessage}
                     onSendSticker={sendSticker}
                     onTakePhoto={takeNativePhoto}
@@ -7578,14 +7771,40 @@ export default function FluxChat() {
             </div>
           </div>
           <div className="mp-footer">
-            <div className="mp-caption-wrapper">
+            <div className="mp-caption-wrapper" style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <input
                 type="text"
                 placeholder="Add a caption..."
                 value={inputMsg}
                 onChange={e => setInputMsg(e.target.value)}
                 className="mp-caption-input"
+                style={{ flex: 1 }}
               />
+              {pendingFiles.some(f => f.type === "image" || f.type === "video") && (
+                <button
+                  type="button"
+                  onClick={() => setIsViewOnceSelected(prev => !prev)}
+                  title={isViewOnceSelected ? "View Once is ON" : "Set to View Once"}
+                  style={{
+                    width: 36,
+                    height: 36,
+                    borderRadius: "50%",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    fontSize: 16,
+                    fontWeight: 700,
+                    cursor: "pointer",
+                    border: isViewOnceSelected ? "2px solid #6daf78" : "1.5px dashed var(--border)",
+                    background: isViewOnceSelected ? "rgba(109, 175, 120, 0.2)" : "transparent",
+                    color: isViewOnceSelected ? "#6daf78" : "var(--text-3)",
+                    transition: "all 0.2s ease",
+                    flexShrink: 0,
+                  }}
+                >
+                  ①
+                </button>
+              )}
             </div>
             <div className="mp-controls-row">
               <button className="mp-add-more-btn" onClick={() => fileInputRef.current?.click()}>

@@ -69,7 +69,7 @@ export function useWebSocket(opts: UseWebSocketOptions) {
   }, []);
 
   // ── wsSend ────────────────────────────────────────────────────────────────
-  const wsSend = useCallback((msg: string) => {
+  const wsSend = useCallback((msg: string, outboxItem?: any) => {
     const ws = wsRef.current;
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(msg);
@@ -78,6 +78,11 @@ export function useWebSocket(opts: UseWebSocketOptions) {
       const user = useAuthStore.getState().currentUser;
       if (user) {
         idbSet(`pending_messages_${user}`, pendingMessages.current).catch(() => {});
+      }
+      if (outboxItem) {
+        import("@/lib/db").then(({ dbEnqueueOutbox }) => {
+          dbEnqueueOutbox(outboxItem).catch(() => {});
+        });
       }
     }
   }, []);
@@ -238,6 +243,18 @@ export function useWebSocket(opts: UseWebSocketOptions) {
             );
           }
         }
+
+        // Automatic delivery acknowledgment to sender
+        if (dataUser !== me && rawMsg.id && !String(rawMsg.id).startsWith("temp-")) {
+          const ws = wsRef.current;
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: "message_delivered",
+              message_id: rawMsg.id,
+              sender_email: dataUser,
+            }));
+          }
+        }
         break;
       }
 
@@ -345,19 +362,95 @@ export function useWebSocket(opts: UseWebSocketOptions) {
         });
         break;
 
-      case "read_receipt":
-        useChatStore.getState().setMessages((prev) =>
+      case "message_ack": {
+        const clientMsgId = (data as any).client_msg_id;
+        const serverId = (data as any).id;
+        const isDelivered = Boolean((data as any).is_delivered);
+        const targetUser = (data as any).target_user ? String((data as any).target_user).toLowerCase() : "";
+
+        if (clientMsgId) {
+          import("@/lib/db").then(({ dbRemoveFromOutbox }) => {
+            dbRemoveFromOutbox(String(clientMsgId)).catch(() => {});
+          });
+          const updater = (prev: Message[]) =>
+            prev.map((m) =>
+              String(m.id) === String(clientMsgId)
+                ? { ...m, id: serverId || m.id, status: isDelivered ? ("delivered" as const) : ("sent" as const), is_delivered: isDelivered }
+                : m
+            );
+          useChatStore.getState().setMessages(updater);
+          if (targetUser && messagesCacheRef) {
+            updateMsgCache(targetUser, updater);
+          }
+        }
+        break;
+      }
+
+      case "message_delivered": {
+        const deliveredId = (data as any).message_id;
+        const updater = (prev: Message[]) =>
+          prev.map((m) =>
+            String(m.id) === String(deliveredId)
+              ? { ...m, is_delivered: true, status: "delivered" as const }
+              : m
+          );
+        useChatStore.getState().setMessages(updater);
+        if (messagesCacheRef) {
+          Object.keys(messagesCacheRef).forEach((cid) => {
+            messagesCacheRef[cid] = updater(messagesCacheRef[cid] || []);
+          });
+        }
+        break;
+      }
+
+      case "view_once_opened": {
+        const openedId = (data as any).message_id;
+        const updater = (prev: Message[]) =>
+          prev.map((m) =>
+            String(m.id) === String(openedId)
+              ? { ...m, is_opened: true }
+              : m
+          );
+        useChatStore.getState().setMessages(updater);
+        if (messagesCacheRef) {
+          Object.keys(messagesCacheRef).forEach((cid) => {
+            messagesCacheRef[cid] = updater(messagesCacheRef[cid] || []);
+          });
+        }
+        break;
+      }
+
+      case "read_receipt": {
+        const peer = (data as any).peer_email || (data as any).user;
+        const mids = (data as any).message_ids as (number | string)[] | undefined;
+        const updater = (prev: Message[]) =>
           prev.map((m) => {
             if (String(m.user).toLowerCase() !== me) return m;
+            if (mids && mids.length > 0) {
+              if (mids.map(String).includes(String(m.id))) {
+                return { ...m, is_read: true, is_delivered: true, status: "read" as const };
+              }
+              return m;
+            }
             if (data.group_id && m.group_id === data.group_id) {
               const rb = m.read_by || [];
               const u = String(data.user).toLowerCase();
-              if (!rb.includes(u)) return { ...m, is_read: true, read_by: [...rb, u] };
-            } else if (!data.group_id && !m.group_id) return { ...m, is_read: true };
+              if (!rb.includes(u)) return { ...m, is_read: true, is_delivered: true, read_by: [...rb, u] };
+            } else if (!data.group_id && !m.group_id) {
+              if (!peer || m.target_user?.toLowerCase() === String(peer).toLowerCase() || m.receiver_email?.toLowerCase() === String(peer).toLowerCase()) {
+                return { ...m, is_read: true, is_delivered: true, status: "read" as const };
+              }
+            }
             return m;
-          })
-        );
+          });
+        useChatStore.getState().setMessages(updater);
+        if (messagesCacheRef) {
+          Object.keys(messagesCacheRef).forEach((cid) => {
+            messagesCacheRef[cid] = updater(messagesCacheRef[cid] || []);
+          });
+        }
         break;
+      }
 
       case "message_edited": {
         const rawMsg = data as Message;
@@ -563,6 +656,20 @@ export function useWebSocket(opts: UseWebSocketOptions) {
           idbDel(`pending_messages_${user}`).catch(() => {});
         }
       }
+
+      // Drain persistent IndexedDB outbox in strict FIFO order
+      import("@/lib/db").then(({ dbGetPendingOutbox, dbRemoveFromOutbox }) => {
+        dbGetPendingOutbox().then((outboxItems) => {
+          if (outboxItems && outboxItems.length > 0) {
+            for (const item of outboxItems) {
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(item.payload));
+                dbRemoveFromOutbox(item.id).catch(() => {});
+              }
+            }
+          }
+        }).catch(() => {});
+      });
 
       // Fetch unread counts
       apiFetch<Record<string, number>>("/unread-counts").then((counts) => {

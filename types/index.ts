@@ -67,8 +67,10 @@ export type Group = {
 export type Message = {
   id: string | number; user: string; content: string; timestamp: string;
   group_id?: string | number; group_name?: string; receiver_email?: string;
-  target_user?: string; is_read?: boolean; is_deleted?: boolean;
-  deleted_by?: string; deleted_by_name?: string;
+  target_user?: string; is_read?: boolean; is_delivered?: boolean;
+  is_view_once?: boolean; is_opened?: boolean;
+  client_msg_id?: string; status?: "pending" | "sent" | "delivered" | "read" | "failed";
+  is_deleted?: boolean; deleted_by?: string; deleted_by_name?: string;
   edited_at?: string; is_edited?: boolean; reply_to_id?: string | number; reply_to_content?: string;
   reply_to?: { id?: string | number; user: string; content: string; sender_name?: string };
   reactions?: Record<string, string[]>; read_by?: string[];
